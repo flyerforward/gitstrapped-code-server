@@ -13,6 +13,10 @@ services:
       GH_TOKEN: "${GH_TOKEN}"        # fine-grained read-only PAT
       GIT_REPOS: "${GIT_REPOS}"      # comma-separated (owner/repo[#branch] or https URL)
       GIT_BASE_DIR: "/config/workspace"
+      GIT_ASKPASS: "/bin/true"
+      SSH_ASKPASS: "/bin/true"
+      GIT_TERMINAL_PROMPT: "0"
+      GCM_INTERACTIVE: "Never" 
     volumes:
       - code-config:/config
       - projects:/config/workspace

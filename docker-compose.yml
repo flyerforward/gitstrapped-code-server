@@ -22,6 +22,9 @@ services:
       - projects:/config/workspace
       - ./init/10-git.sh:/custom-cont-init.d/10-git.sh:ro
       - ./init/20-vscode-settings.sh:/custom-cont-init.d/20-vscode-settings.sh:ro
+
+      - code-null-github-auth:/app/code-server/lib/vscode/extensions/github-authentication
+      - code-null-github-pr:/app/code-server/lib/vscode/extensions/vscode-pull-request-github
     ports:
       - ":8443"                      # random host port -> container 8443
     restart: unless-stopped
@@ -29,3 +32,6 @@ services:
 volumes:
   code-config: {}
   projects: {}
+
+  code-null-github-auth: {}
+  code-null-github-pr: {}

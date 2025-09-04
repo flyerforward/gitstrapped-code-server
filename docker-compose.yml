@@ -5,18 +5,18 @@ services:
       PUID: "1000"
       PGID: "1000"
       TZ: "America/Toronto"
-      PASSWORD: "${PASSWORD}"
+      PASSWORD: "${PASSWORD}"  # Use this for authentication (not optional)
       GIT_NAME: "${GIT_NAME}"
       GIT_EMAIL: "${GIT_EMAIL}"
-      GIT_REPOS: "${GIT_REPOS}"
-      GH_PAT: "{GH_PAT}"
+      GIT_REPOS: "${GIT_REPOS}"  # List of repositories to clone, comma-separated
       GIT_BASE_DIR: "/config/workspace"
+      GH_PAT: "${GH_PAT}"  # GitHub Personal Access Token for adding SSH key to GitHub
     volumes:
       - code-config:/config
       - projects:/config/workspace
       - ./init/10-git.sh:/custom-cont-init.d/10-git.sh:ro
       - ./init/20-vscode-settings.sh:/custom-cont-init.d/20-vscode-settings.sh:ro
-      - ssh-keys:/root/.ssh  # Make sure this is read-write
+      - ssh-keys:/root/.ssh  # Persistent SSH keys
     ports:
       - ":8443"
     restart: unless-stopped
@@ -24,4 +24,4 @@ services:
 volumes:
   code-config: {}
   projects: {}
-  ssh-keys: {}  # Make sure this volume is read-write
+  ssh-keys: {}  # Persistent volume for SSH keys

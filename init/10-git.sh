@@ -29,17 +29,17 @@ git config --global --unset-all credential.helper || true
 git config --global --add credential.helper "store --file /config/.git-credentials"
 
 # Persist token once (optional but convenient for pulls/pushes)
-if [ -n "${GH_USER:-}" ] && [ -n "${GH_TOKEN:-}" ]; then
+if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ]; then
   CRED="/config/.git-credentials"
   if ! grep -q "github.com" "$CRED" 2>/dev/null; then
-    printf "https://%s:%s@github.com\n" "$GH_USER" "$GH_TOKEN" >> "$CRED"
+    printf "https://%s:%s@github.com\n" "$GH_USER" "$GH_PAT" >> "$CRED"
     chmod 600 "$CRED"
     log "credentials written to $CRED"
   else
     log "credentials already present in $CRED"
   fi
 else
-  log "GH_USER/GH_TOKEN not set; private clones/push will fail"
+  log "GH_USER/GH_PAT not set; private clones/push will fail"
 fi
 
 clone_one() {
@@ -65,8 +65,8 @@ clone_one() {
       ;;
     */*)
       name="$(basename "$repo")"
-      if [ -n "${GH_USER:-}" ] && [ -n "${GH_TOKEN:-}" ]; then
-        url="https://${GH_USER}:${GH_TOKEN}@github.com/${repo}.git"
+      if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ]; then
+        url="https://${GH_USER}:${GH_PAT}@github.com/${repo}.git"
       else
         url="https://github.com/${repo}.git"
       fi

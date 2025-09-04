@@ -10,7 +10,7 @@ services:
       GIT_NAME: "${GIT_NAME}"
       GIT_EMAIL: "${GIT_EMAIL}"
       GH_USER: "${GH_USER}"          # set as a secret in Dokploy
-      GH_TOKEN: "${GH_TOKEN}"        # fine-grained read-only PAT
+      GH_PAT: "${GH_PAT}"        # fine-grained read-only PAT
       GIT_REPOS: "${GIT_REPOS}"      # comma-separated (owner/repo[#branch] or https URL)
       GIT_BASE_DIR: "/config/workspace"
       GIT_ASKPASS: "/bin/true"

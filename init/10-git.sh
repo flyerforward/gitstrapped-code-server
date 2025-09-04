@@ -52,6 +52,7 @@ if [ ! -f "$PRIVATE_KEY_PATH" ]; then
 
   # Automatically add GitHub's SSH key to known hosts to avoid "Host key verification failed"
   ssh-keyscan github.com >> /root/.ssh/known_hosts
+  chmod 644 /root/.ssh/known_hosts
 
   # Upload the SSH public key to GitHub
   if [ -n "${GH_PAT:-}" ]; then
@@ -72,6 +73,9 @@ if [ ! -f "$PRIVATE_KEY_PATH" ]; then
 else
   log "SSH key already exists, skipping generation."
 fi
+
+# Ensure Git is using the correct SSH key
+git config --global core.sshCommand "ssh -i /root/.ssh/id_rsa -F /dev/null"
 
 # Clone repositories using SSH
 clone_one() {

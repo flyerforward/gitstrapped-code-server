@@ -24,24 +24,43 @@ git config --global init.defaultBranch main || true
 git config --global pull.ff only || true
 git config --global advice.detachedHead false || true
 
-# Force credential helper file in /config
-git config --global --unset-all credential.helper || true
-git config --global --add credential.helper "store --file /config/.git-credentials"
+# SSH Key Generation and Persistence
+SSH_DIR="/root/.ssh"
+KEY_NAME="id_rsa"
+PRIVATE_KEY_PATH="$SSH_DIR/$KEY_NAME"
+PUBLIC_KEY_PATH="$SSH_DIR/${KEY_NAME}.pub"
 
-# Persist token once (optional but convenient for pulls/pushes)
-if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ]; then
-  CRED="/config/.git-credentials"
-  if ! grep -q "github.com" "$CRED" 2>/dev/null; then
-    printf "https://%s:%s@github.com\n" "$GH_USER" "$GH_PAT" >> "$CRED"
-    chmod 600 "$CRED"
-    log "credentials written to $CRED"
+if [ ! -f "$PRIVATE_KEY_PATH" ]; then
+  log "Generating new SSH key pair"
+  mkdir -p "$SSH_DIR"
+  ssh-keygen -t rsa -b 4096 -f "$PRIVATE_KEY_PATH" -N "" -C "${GIT_EMAIL:-git@github.com}" # Generate key with no passphrase
+  chmod 600 "$PRIVATE_KEY_PATH"
+  chmod 644 "$PUBLIC_KEY_PATH"
+  
+  log "SSH key pair generated"
+
+  # Save SSH public key and prepare to upload to GitHub
+  SSH_PUBLIC_KEY=$(cat "$PUBLIC_KEY_PATH")
+
+  log "SSH Public Key:"
+  log "$SSH_PUBLIC_KEY"
+
+  # Upload the SSH public key to GitHub
+  if [ -n "${GH_PAT:-}" ]; then
+    log "Adding SSH key to GitHub..."
+    curl -X POST -H "Authorization: token ${GH_PAT}" \
+      -d '{"title": "Docker SSH Key", "key": "'"${SSH_PUBLIC_KEY}"'"}' \
+      "https://api.github.com/user/keys"
+    
+    log "SSH key added to GitHub"
   else
-    log "credentials already present in $CRED"
+    log "GH_PAT not set; SSH key was not added to GitHub"
   fi
 else
-  log "GH_USER/GH_PAT not set; private clones/push will fail"
+  log "SSH key already exists, skipping generation."
 fi
 
+# Clone repositories using SSH
 clone_one() {
   spec="$1"
   [ -n "$spec" ] || return 0
@@ -56,20 +75,16 @@ clone_one() {
     *'#'*) branch="${spec#*#}"; repo="${spec%%#*}";;
   esac
 
-  # build URL + dest name
+  # build URL + dest name (using SSH)
   case "$repo" in
-    http*://*)
+    *"git@github.com:"*)
       url="$repo"
       name="$(basename "$repo" .git)"
-      owner_repo="$(echo "$repo" | sed -nE 's#.*github\.com/([^/]+/[^/.]+)(\.git)?$#\1#p')"
+      owner_repo="$repo"
       ;;
     */*)
       name="$(basename "$repo")"
-      if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ]; then
-        url="https://${GH_USER}:${GH_PAT}@github.com/${repo}.git"
-      else
-        url="https://github.com/${repo}.git"
-      fi
+      url="git@github.com:${repo}.git"
       owner_repo="$repo"
       ;;
     *)
@@ -79,7 +94,7 @@ clone_one() {
   esac
 
   dest="${BASE}/${name}"
-  safe_url="$(echo "$url" | sed -E 's#(https://)[^:]+:[^@]+@#\1***:***@#')"
+  safe_url="$(echo "$url" | sed -E 's#(git@github\.com:)[^@]+@#\1***@#')"
 
   if [ -d "$dest/.git" ]; then
     log "pull: ${name}"
@@ -97,10 +112,6 @@ clone_one() {
     else
       git clone "$url" "$dest" || { log "clone failed: $spec"; return 0; }
     fi
-    # Reset remote to token-less URL
-    if [ -n "${owner_repo:-}" ]; then
-      git -C "$dest" remote set-url origin "https://github.com/${owner_repo}.git" || true
-    fi
   fi
 
   chown -R "${PUID:-1000}:${PGID:-1000}" "$dest" || true
@@ -114,5 +125,4 @@ else
   log "GIT_REPOS is empty; nothing to clone"
 fi
 
-log "final helper: $(git config --global --get credential.helper || true)"
 log "done"

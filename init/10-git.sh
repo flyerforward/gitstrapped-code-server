@@ -75,24 +75,18 @@ else
   log "SSH key already exists, skipping generation."
 fi
 
-# Debugging: Check permissions of the SSH key
-log "Checking SSH key permissions"
-ls -l /root/.ssh
-
-# Debugging: Check ownership
-log "Checking ownership of SSH key files"
-stat /root/.ssh/id_rsa
+# Ensure the correct ownership and permissions
+chmod 600 /root/.ssh/id_rsa
+chmod 644 /root/.ssh/id_rsa.pub
+chmod 644 /root/.ssh/known_hosts
+chown -R abc:abc /root/.ssh
 
 # Ensure Git is using the correct SSH key
 log "Ensuring Git uses the correct SSH key"
 git config --global core.sshCommand "ssh -i /root/.ssh/id_rsa -F /dev/null"
 
-# Debugging: Check if the SSH key is being used correctly by Git
-log "Testing SSH connection to GitHub"
-ssh -T git@github.com
-
-# Set up ssh-agent to handle the key management automatically
-log "Starting ssh-agent to manage the key"
+# Start ssh-agent and add the SSH key
+log "Starting ssh-agent and adding the SSH key"
 eval $(ssh-agent -s)
 ssh-add /root/.ssh/id_rsa
 

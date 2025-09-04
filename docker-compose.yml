@@ -2,8 +2,8 @@ services:
   code:
     image: lscr.io/linuxserver/code-server:4.101.1
     environment:
-      PUID: "1000"
-      PGID: "1000"
+      PUID: "0"
+      PGID: "0"
       TZ: "America/Toronto"
       PASSWORD: "${PASSWORD}"  # Use this for authentication (not optional)
       GIT_NAME: "${GIT_NAME}"

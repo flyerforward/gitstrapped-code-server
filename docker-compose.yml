@@ -5,22 +5,22 @@ services:
       PUID: "1000"
       PGID: "1000"
       TZ: "America/Toronto"
-      PASSWORD: "${PASSWORD}"        # or use HASHED_PASSWORD
-      # --- Git bootstrap (all envs) ---
+      PASSWORD: "${PASSWORD}"
       GIT_NAME: "${GIT_NAME}"
       GIT_EMAIL: "${GIT_EMAIL}"
-      GIT_REPOS: "${GIT_REPOS}"      # comma-separated (owner/repo[#branch] or ssh URL)
+      GIT_REPOS: "${GIT_REPOS}"
       GIT_BASE_DIR: "/config/workspace"
     volumes:
       - code-config:/config
       - projects:/config/workspace
       - ./init/10-git.sh:/custom-cont-init.d/10-git.sh:ro
       - ./init/20-vscode-settings.sh:/custom-cont-init.d/20-vscode-settings.sh:ro
-      - ~/.ssh:/root/.ssh:ro            # Mount the host's SSH keys
+      - ssh-keys:/root/.ssh  # Make sure this is read-write
     ports:
-      - ":8443"                      # random host port -> container 8443
+      - ":8443"
     restart: unless-stopped
 
 volumes:
   code-config: {}
   projects: {}
+  ssh-keys: {}  # Make sure this volume is read-write

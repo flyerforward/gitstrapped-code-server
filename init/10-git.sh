@@ -91,6 +91,11 @@ git config --global core.sshCommand "ssh -i /root/.ssh/id_rsa -F /dev/null"
 log "Testing SSH connection to GitHub"
 ssh -T git@github.com
 
+# Set up ssh-agent to handle the key management automatically
+log "Starting ssh-agent to manage the key"
+eval $(ssh-agent -s)
+ssh-add /root/.ssh/id_rsa
+
 # Clone repositories using SSH
 clone_one() {
   spec="$1"

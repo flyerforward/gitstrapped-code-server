@@ -30,9 +30,14 @@ KEY_NAME="id_rsa"
 PRIVATE_KEY_PATH="$SSH_DIR/$KEY_NAME"
 PUBLIC_KEY_PATH="$SSH_DIR/${KEY_NAME}.pub"
 
+# Ensure the SSH directory is owned by the correct user
+log "Ensuring the correct ownership for the SSH directory"
+mkdir -p "$SSH_DIR"
+chown -R "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR"
+chmod 700 "$SSH_DIR"
+
 if [ ! -f "$PRIVATE_KEY_PATH" ]; then
   log "Generating new SSH key pair"
-  mkdir -p "$SSH_DIR"
   ssh-keygen -t rsa -b 4096 -f "$PRIVATE_KEY_PATH" -N "" -C "${GIT_EMAIL:-git@github.com}" # Generate key with no passphrase
   chmod 600 "$PRIVATE_KEY_PATH"
   chmod 644 "$PUBLIC_KEY_PATH"

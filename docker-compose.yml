@@ -1,4 +1,4 @@
-services: 
+services:
   code:
     image: lscr.io/linuxserver/code-server:4.101.1
     environment:
@@ -9,22 +9,14 @@ services:
       # --- Git bootstrap (all envs) ---
       GIT_NAME: "${GIT_NAME}"
       GIT_EMAIL: "${GIT_EMAIL}"
-      GH_USER: "${GH_USER}"          # set as a secret in Dokploy
-      GH_PAT: "${GH_PAT}"        # fine-grained read-only PAT
-      GIT_REPOS: "${GIT_REPOS}"      # comma-separated (owner/repo[#branch] or https URL)
+      GIT_REPOS: "${GIT_REPOS}"      # comma-separated (owner/repo[#branch] or ssh URL)
       GIT_BASE_DIR: "/config/workspace"
-      GIT_ASKPASS: "/bin/true"
-      SSH_ASKPASS: "/bin/true"
-      GIT_TERMINAL_PROMPT: "0"
-      GCM_INTERACTIVE: "Never" 
     volumes:
       - code-config:/config
       - projects:/config/workspace
       - ./init/10-git.sh:/custom-cont-init.d/10-git.sh:ro
       - ./init/20-vscode-settings.sh:/custom-cont-init.d/20-vscode-settings.sh:ro
-
-      - code-null-github-auth:/app/code-server/lib/vscode/extensions/github-authentication
-      - code-null-github-pr:/app/code-server/lib/vscode/extensions/vscode-pull-request-github
+      - ~/.ssh:/root/.ssh:ro            # Mount the host's SSH keys
     ports:
       - ":8443"                      # random host port -> container 8443
     restart: unless-stopped
@@ -32,6 +24,3 @@ services:
 volumes:
   code-config: {}
   projects: {}
-
-  code-null-github-auth: {}
-  code-null-github-pr: {}

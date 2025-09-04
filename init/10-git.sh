@@ -36,6 +36,7 @@ mkdir -p "$SSH_DIR"
 chown -R "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
+# Check if the private key already exists
 if [ ! -f "$PRIVATE_KEY_PATH" ]; then
   log "Generating new SSH key pair"
   ssh-keygen -t rsa -b 4096 -f "$PRIVATE_KEY_PATH" -N "" -C "${GIT_EMAIL:-git@github.com}" # Generate key with no passphrase
@@ -74,8 +75,21 @@ else
   log "SSH key already exists, skipping generation."
 fi
 
+# Debugging: Check permissions of the SSH key
+log "Checking SSH key permissions"
+ls -l /root/.ssh
+
+# Debugging: Check ownership
+log "Checking ownership of SSH key files"
+stat /root/.ssh/id_rsa
+
 # Ensure Git is using the correct SSH key
+log "Ensuring Git uses the correct SSH key"
 git config --global core.sshCommand "ssh -i /root/.ssh/id_rsa -F /dev/null"
+
+# Debugging: Check if the SSH key is being used correctly by Git
+log "Testing SSH connection to GitHub"
+ssh -T git@github.com
 
 # Clone repositories using SSH
 clone_one() {

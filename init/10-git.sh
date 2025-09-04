@@ -45,6 +45,9 @@ if [ ! -f "$PRIVATE_KEY_PATH" ]; then
   log "SSH Public Key:"
   log "$SSH_PUBLIC_KEY"
 
+  # Automatically add GitHub's SSH key to known hosts to avoid "Host key verification failed"
+  ssh-keyscan github.com >> /root/.ssh/known_hosts
+
   # Upload the SSH public key to GitHub
   if [ -n "${GH_PAT:-}" ]; then
     log "Adding SSH key to GitHub..."

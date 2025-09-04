@@ -44,9 +44,6 @@ if [ ! -f "$PRIVATE_KEY_PATH" ]; then
   
   log "SSH key pair generated"
 
-  chmod 600 /root/.ssh/id_rsa
-  chmod 644 /root/.ssh/id_rsa.pub
-
   # Save SSH public key and prepare to upload to GitHub
   SSH_PUBLIC_KEY=$(cat "$PUBLIC_KEY_PATH")
 

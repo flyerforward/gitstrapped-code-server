@@ -9,6 +9,7 @@ services:
       GIT_NAME: "${GIT_NAME}"
       GIT_EMAIL: "${GIT_EMAIL}"
       GIT_REPOS: "${GIT_REPOS}"
+      GH_PAT: "{GH_PAT}"
       GIT_BASE_DIR: "/config/workspace"
     volumes:
       - code-config:/config

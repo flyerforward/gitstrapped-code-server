@@ -51,11 +51,16 @@ if [ ! -f "$PRIVATE_KEY_PATH" ]; then
   # Upload the SSH public key to GitHub
   if [ -n "${GH_PAT:-}" ]; then
     log "Adding SSH key to GitHub..."
-    curl -X POST -H "Authorization: token ${GH_PAT}" \
+    RESPONSE=$(curl -X POST -H "Authorization: token ${GH_PAT}" \
       -d '{"title": "Docker SSH Key", "key": "'"${SSH_PUBLIC_KEY}"'"}' \
-      "https://api.github.com/user/keys"
-    
-    log "SSH key added to GitHub"
+      "https://api.github.com/user/keys")
+
+    log "GitHub Response: $RESPONSE"
+    if echo "$RESPONSE" | grep -q '"id"'; then
+      log "SSH key added successfully"
+    else
+      log "Failed to add SSH key to GitHub: $RESPONSE"
+    fi
   else
     log "GH_PAT not set; SSH key was not added to GitHub"
   fi

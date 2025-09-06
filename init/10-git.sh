@@ -20,9 +20,9 @@ chown -R "${PUID:-1000}:${PGID:-1000}" "$BASE" || true
 git config --global init.defaultBranch main || true
 git config --global pull.ff only || true
 git config --global advice.detachedHead false || true
-# Mark workspace as safe (avoids 'dubious ownership' warnings)
-git config --global --add safe.directory "$BASE"
-git config --global --add safe.directory "$BASE/*"
+
+# Add the base workspace as safe (git won't expand globs, so we also add each repo below)
+git config --global --add safe.directory "$BASE" || true
 
 # -------- SSH under /config/.ssh (non-root) --------
 SSH_DIR="/config/.ssh"
@@ -98,6 +98,13 @@ chmod 644 "$SSH_DIR/known_hosts" || true
 chown -R "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR"
 
 # -------- clone/pull helper --------
+add_safe_dir() {
+  # add path as safe directory (idempotent)
+  p="$1"
+  [ -n "$p" ] || return 0
+  git config --global --add safe.directory "$p" || true
+}
+
 clone_one() {
   spec="$1"
   [ -n "$spec" ] || return 0
@@ -137,6 +144,14 @@ clone_one() {
   dest="${BASE}/${name}"
   safe_url="$(echo "$url" | sed -E 's#(git@github\.com:).*#\1***.git#')"
 
+  # Ensure ownership first (fixes 'dubious ownership' if previous runs created as root)
+  if [ -d "$dest" ]; then
+    chown -R "${PUID:-1000}:${PGID:-1000}" "$dest" || true
+  fi
+
+  # Always add safe.directory for this exact repo path (prevents 'dubious ownership')
+  add_safe_dir "$dest"
+
   if [ -d "$dest/.git" ]; then
     log "pull: ${name}"
     git -C "$dest" fetch --all -p || true
@@ -153,9 +168,10 @@ clone_one() {
     else
       git clone "$url" "$dest" || { log "clone failed: $spec"; return 0; }
     fi
+    # After clone, ensure ownership and mark safe again (idempotent)
+    chown -R "${PUID:-1000}:${PGID:-1000}" "$dest" || true
+    add_safe_dir "$dest"
   fi
-
-  chown -R "${PUID:-1000}:${PGID:-1000}" "$dest" || true
 }
 
 # -------- clone the list --------

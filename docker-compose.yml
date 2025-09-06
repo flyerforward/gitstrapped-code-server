@@ -18,7 +18,7 @@ services:
       - ./init/20-vscode-settings.sh:/custom-cont-init.d/20-vscode-settings.sh:ro
     ports:
       - ":8443"
-    restart: unless-stopped
+    restart: always
 
 volumes:
   code-config: {}

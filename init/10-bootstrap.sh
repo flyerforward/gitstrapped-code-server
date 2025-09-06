@@ -60,10 +60,9 @@ INPUTS_JSON='[
   { "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
 ]'
 KEYB_JSON='{
-  "key": "ctrl+alt+g",
+  "key": "ctrl+g+s",
   "command": "workbench.action.tasks.runTask",
   "args": "Bootstrap GitHub Workspace",
-  "when": "editorTextFocus"
 }'
 
 # ---------------------------

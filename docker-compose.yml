@@ -6,19 +6,17 @@ services:
       PGID: "1000"
       TZ: "America/Toronto"
       PASSWORD: "${PASSWORD}"
-      GH_USER: "${GH_USER}"          # required
-      GH_PAT: "${GH_PAT}"            # required (user:email, admin:public_key)
-      GIT_NAME: "${GIT_NAME}"        # optional (defaults to GH_USER)
-      GIT_EMAIL: "${GIT_EMAIL}"      # optional (overrides auto-resolved email)
-      GIT_REPOS: "${GIT_REPOS}"      # required list
+      GH_USER: "${GH_USER}"          # optional for auto-run; required for manual run
+      GH_PAT: "${GH_PAT}"            # optional for auto-run; required for manual run
+      GIT_NAME: "${GIT_NAME}"
+      GIT_EMAIL: "${GIT_EMAIL}"
+      GIT_REPOS: "${GIT_REPOS}"
       GIT_BASE_DIR: "/config/workspace"
-
     volumes:
       - code-config:/config
       - projects:/config/workspace
-      - ./config/bin/bootstrap.sh:/config/bin/bootstrap.sh:ro
-      #- ./init/10-git.sh:/custom-cont-init.d/10-git.sh:ro
-      - ./.vscode:/config/workspace/.vscode:ro 
+      - ./bootstrap.sh:/config/bin/bootstrap.sh:ro
+      - ./init/00-bootstrap-on-start.sh:/init/00-bootstrap-on-start.sh:ro
     ports:
       - ":8443"
     restart: always

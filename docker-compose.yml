@@ -16,7 +16,7 @@ services:
       - code-config:/config
       - projects:/config/workspace
       - ./bootstrap.sh:/config/bin/bootstrap.sh:ro
-      - ./init/00-bootstrap-on-start.sh:/init/00-bootstrap-on-start.sh:ro
+      - ./init/00-bootstrap-on-start.sh:/custom-cont-init.d/00-bootstrap-on-start.sh:ro
     ports:
       - ":8443"
     restart: always

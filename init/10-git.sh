@@ -7,7 +7,7 @@ log "start"
 log "env: GIT_NAME='${GIT_NAME:-}' GIT_EMAIL='${GIT_EMAIL:-}'"
 log "env: GIT_REPOS='${GIT_REPOS:-}'"
 
-# The LSIO 'abc' user's HOME is /config; ensure git writes configs there.
+# LSIO 'abc' user's HOME is /config; ensure git writes configs there.
 export HOME=/config
 
 # -------- workspace & git defaults --------
@@ -20,7 +20,6 @@ chown -R "${PUID:-1000}:${PGID:-1000}" "$BASE" || true
 git config --global init.defaultBranch main || true
 git config --global pull.ff only || true
 git config --global advice.detachedHead false || true
-
 # Mark workspace as safe (avoids 'dubious ownership' warnings)
 git config --global --add safe.directory "$BASE"
 git config --global --add safe.directory "$BASE/*"
@@ -46,7 +45,7 @@ else
   log "SSH key already exists; skipping generation"
 fi
 
-# Ensure known_hosts exists and has GitHub; accept-new as fallback
+# known_hosts + ssh options
 touch "$SSH_DIR/known_hosts"
 chmod 644 "$SSH_DIR/known_hosts"
 chown "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR/known_hosts"
@@ -62,15 +61,31 @@ fi
 git config --global core.sshCommand \
   "ssh -i $PRIVATE_KEY_PATH -F /dev/null -o IdentitiesOnly=yes -o UserKnownHostsFile=$SSH_DIR/known_hosts -o StrictHostKeyChecking=accept-new"
 
-# Upload public key to GitHub if GH_PAT provided
+# -------- Always-on GitHub upload (idempotent) --------
+# Requires a PAT with permission to create user SSH keys (classic PAT scope: admin:public_key)
 if [ -n "${GH_PAT:-}" ]; then
-  SSH_PUBLIC_KEY="$(cat "$PUBLIC_KEY_PATH")"
-  log "Adding SSH key to GitHub via API..."
-  RESPONSE=$(curl -sS -X POST -H "Authorization: token ${GH_PAT}" \
-    -H "Accept: application/vnd.github+json" \
-    -d '{"title":"Docker SSH Key","key":"'"$SSH_PUBLIC_KEY"'"}' \
-    "https://api.github.com/user/keys" || true)
-  echo "$RESPONSE" | grep -q '"id"' && log "SSH key added to GitHub" || log "Failed to add key: $RESPONSE"
+  # Normalize local key to "type key" (strip comment) for reliable comparison
+  LOCAL_KEY="$(awk '{print $1" "$2}' "$PUBLIC_KEY_PATH")"
+  TITLE="${GH_KEY_TITLE:-Docker SSH Key}"
+
+  log "Checking if SSH key already exists on GitHub..."
+  KEYS_JSON="$(curl -sS -H "Authorization: token ${GH_PAT}" -H "Accept: application/vnd.github+json" https://api.github.com/user/keys || true)"
+
+  if echo "$KEYS_JSON" | grep -q "\"key\": *\"$LOCAL_KEY\""; then
+    log "SSH key already present on GitHub; skipping upload"
+  else
+    log "Adding SSH key to GitHub via API..."
+    RESP="$(curl -sS -X POST \
+      -H "Authorization: token ${GH_PAT}" \
+      -H "Accept: application/vnd.github+json" \
+      -d "{\"title\":\"$TITLE\",\"key\":\"$LOCAL_KEY\"}" \
+      https://api.github.com/user/keys || true)"
+    if echo "$RESP" | grep -q '"id"'; then
+      log "SSH key added to GitHub"
+    else
+      log "Failed to add key: $RESP"
+    fi
+  fi
 else
   log "GH_PAT not set; skipping GitHub key upload"
 fi

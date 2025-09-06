@@ -7,95 +7,78 @@ log "start"
 log "env: GIT_NAME='${GIT_NAME:-}' GIT_EMAIL='${GIT_EMAIL:-}'"
 log "env: GIT_REPOS='${GIT_REPOS:-}'"
 
-# Make 'git config --global' and credential helper write under /config (LSIO user's home)
+# The LSIO 'abc' user's HOME is /config; ensure git writes configs there.
 export HOME=/config
-
-git config --global --add safe.directory /config/workspace
-git config --global --add safe.directory /config/workspace/*
 
 BASE="${GIT_BASE_DIR:-/config/workspace}"
 mkdir -p "$BASE" || true
 chown -R "${PUID:-1000}:${PGID:-1000}" "$BASE" || true
 
-# Git identity + sane defaults
+# Safer defaults + identity
 [ -n "${GIT_NAME:-}" ]  && git config --global user.name  "$GIT_NAME"  || true
 [ -n "${GIT_EMAIL:-}" ] && git config --global user.email "$GIT_EMAIL" || true
 git config --global init.defaultBranch main || true
 git config --global pull.ff only || true
 git config --global advice.detachedHead false || true
 
-# SSH Key Generation and Persistence
-SSH_DIR="/root/.ssh"
-KEY_NAME="id_rsa"
+# Mark workspace as safe for git (avoids "detected dubious ownership" when root touched files)
+git config --global --add safe.directory "$BASE"
+git config --global --add safe.directory "$BASE/*"
+
+# ---- SSH setup under /config/.ssh (NOT /root) ----
+SSH_DIR="/config/.ssh"
+KEY_NAME="id_ed25519"
 PRIVATE_KEY_PATH="$SSH_DIR/$KEY_NAME"
 PUBLIC_KEY_PATH="$SSH_DIR/${KEY_NAME}.pub"
 
-# Ensure the SSH directory is owned by the correct user
-log "Ensuring the correct ownership for the SSH directory"
+umask 077
 mkdir -p "$SSH_DIR"
 chown -R "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
-# Check if the private key already exists
 if [ ! -f "$PRIVATE_KEY_PATH" ]; then
-  log "Generating new SSH key pair"
-  ssh-keygen -t rsa -b 4096 -f "$PRIVATE_KEY_PATH" -N "" -C "${GIT_EMAIL:-git@github.com}" # Generate key with no passphrase
+  log "Generating new SSH key pair at $PRIVATE_KEY_PATH"
+  ssh-keygen -t ed25519 -f "$PRIVATE_KEY_PATH" -N "" -C "${GIT_EMAIL:-git@github.com}"
   chmod 600 "$PRIVATE_KEY_PATH"
   chmod 644 "$PUBLIC_KEY_PATH"
-  
-  log "SSH key pair generated"
 
-  # Save SSH public key and prepare to upload to GitHub
-  SSH_PUBLIC_KEY=$(cat "$PUBLIC_KEY_PATH")
+  # Add GitHub to known_hosts to prevent host key prompt
+  touch "$SSH_DIR/known_hosts"
+  ssh-keyscan github.com >> "$SSH_DIR/known_hosts" 2>/dev/null || true
+  chmod 644 "$SSH_DIR/known_hosts"
 
-  log "SSH Public Key:"
-  log "$SSH_PUBLIC_KEY"
-
-  # Automatically add GitHub's SSH key to known hosts to avoid "Host key verification failed"
-  ssh-keyscan github.com >> /root/.ssh/known_hosts
-  chmod 644 /root/.ssh/known_hosts
-
-  # Upload the SSH public key to GitHub
+  # Upload the SSH public key to GitHub (if GH_PAT provided)
   if [ -n "${GH_PAT:-}" ]; then
-    log "Adding SSH key to GitHub..."
-    RESPONSE=$(curl -X POST -H "Authorization: token ${GH_PAT}" \
-      -d '{"title": "Docker SSH Key", "key": "'"${SSH_PUBLIC_KEY}"'"}' \
-      "https://api.github.com/user/keys")
-
-    log "GitHub Response: $RESPONSE"
-    if echo "$RESPONSE" | grep -q '"id"'; then
-      log "SSH key added successfully"
-    else
-      log "Failed to add SSH key to GitHub: $RESPONSE"
-    fi
+    SSH_PUBLIC_KEY=$(cat "$PUBLIC_KEY_PATH")
+    log "Adding SSH key to GitHub via API..."
+    RESPONSE=$(curl -sS -X POST -H "Authorization: token ${GH_PAT}" \
+      -H "Accept: application/vnd.github+json" \
+      -d '{"title":"Docker SSH Key","key":"'"$SSH_PUBLIC_KEY"'"}' \
+      "https://api.github.com/user/keys" || true)
+    echo "$RESPONSE" | grep -q '"id"' && log "SSH key added to GitHub" || log "Failed to add key: $RESPONSE"
   else
-    log "GH_PAT not set; SSH key was not added to GitHub"
+    log "GH_PAT not set; skipping GitHub key upload"
   fi
 else
-  log "SSH key already exists, skipping generation."
+  log "SSH key already exists; skipping generation"
+  # Ensure known_hosts exists and has GitHub
+  touch "$SSH_DIR/known_hosts"
+  grep -q "github.com" "$SSH_DIR/known_hosts" 2>/dev/null || ssh-keyscan github.com >> "$SSH_DIR/known_hosts" 2>/dev/null || true
+  chmod 644 "$SSH_DIR/known_hosts"
 fi
 
-# Ensure the correct ownership and permissions
-chmod 600 /root/.ssh/id_rsa
-chmod 644 /root/.ssh/id_rsa.pub
-chmod 644 /root/.ssh/known_hosts
-chown -R abc:abc /root/.ssh
+# Ensure ownership for abc (PUID/PGID)
+chown -R "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR"
 
-# Ensure Git is using the correct SSH key
-log "Ensuring Git uses the correct SSH key"
-git config --global core.sshCommand "ssh -i /root/.ssh/id_rsa -F /dev/null"
+# Tell git to use this key explicitly (no agent required)
+git config --global core.sshCommand "ssh -i $PRIVATE_KEY_PATH -F /dev/null -o IdentitiesOnly=yes"
 
-# Start ssh-agent and add the SSH key
-log "Starting ssh-agent and adding the SSH key"
-eval $(ssh-agent -s)
-ssh-add /root/.ssh/id_rsa
-
-# Clone repositories using SSH
+# ---- Clone/pull helper ----
 clone_one() {
   spec="$1"
   [ -n "$spec" ] || return 0
 
-  # trim spaces
+  # trim
   spec=$(echo "$spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
   [ -n "$spec" ] || return 0
 
@@ -105,17 +88,22 @@ clone_one() {
     *'#'*) branch="${spec#*#}"; repo="${spec%%#*}";;
   esac
 
-  # build URL + dest name (using SSH)
+  # build URL + dest (SSH preferred)
   case "$repo" in
     *"git@github.com:"*)
       url="$repo"
       name="$(basename "$repo" .git)"
-      owner_repo="$repo"
+      ;;
+    http*://github.com/*|ssh://git@github.com/*)
+      # transform https to ssh
+      name="$(basename "$repo" .git)"
+      owner_repo="$(echo "$repo" | sed -E 's#^https?://github\.com/##; s#^ssh://git@github\.com/##')"
+      owner_repo="${owner_repo%.git}"
+      url="git@github.com:${owner_repo}.git"
       ;;
     */*)
       name="$(basename "$repo")"
       url="git@github.com:${repo}.git"
-      owner_repo="$repo"
       ;;
     *)
       log "skip invalid spec: $spec"
@@ -124,7 +112,7 @@ clone_one() {
   esac
 
   dest="${BASE}/${name}"
-  safe_url="$(echo "$url" | sed -E 's#(git@github\.com:)[^@]+@#\1***@#')"
+  safe_url="$(echo "$url" | sed -E 's#(git@github\.com:).*#\1***.git#')"
 
   if [ -d "$dest/.git" ]; then
     log "pull: ${name}"

@@ -21,10 +21,10 @@ git config --global init.defaultBranch main || true
 git config --global pull.ff only || true
 git config --global advice.detachedHead false || true
 
-# Add the base workspace as safe (git won't expand globs, so we also add each repo below)
+# Add base as safe (we'll add each repo path explicitly too)
 git config --global --add safe.directory "$BASE" || true
 
-# -------- SSH under /config/.ssh (non-root) --------
+# -------- SSH under /config/.ssh --------
 SSH_DIR="/config/.ssh"
 KEY_NAME="id_ed25519"
 PRIVATE_KEY_PATH="$SSH_DIR/$KEY_NAME"
@@ -35,7 +35,6 @@ mkdir -p "$SSH_DIR"
 chown -R "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
-# Generate key if missing
 if [ ! -f "$PRIVATE_KEY_PATH" ]; then
   log "Generating SSH key at $PRIVATE_KEY_PATH"
   ssh-keygen -t ed25519 -f "$PRIVATE_KEY_PATH" -N "" -C "${GIT_EMAIL:-git@github.com}"
@@ -50,27 +49,21 @@ touch "$SSH_DIR/known_hosts"
 chmod 644 "$SSH_DIR/known_hosts"
 chown "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR/known_hosts"
 
-# Pre-seed GitHub host key if ssh-keyscan is available (best-effort)
 if command -v ssh-keyscan >/dev/null 2>&1; then
-  if ! grep -q "^github.com" "$SSH_DIR/known_hosts" 2>/dev/null; then
-    ssh-keyscan github.com >> "$SSH_DIR/known_hosts" 2>/dev/null || true
-  fi
+  grep -q "^github.com" "$SSH_DIR/known_hosts" 2>/dev/null || ssh-keyscan github.com >> "$SSH_DIR/known_hosts" 2>/dev/null || true
 fi
 
-# Force git/ssh to use our key + known_hosts, with safe first-connection behavior
-git config --global core.sshCommand \
-  "ssh -i $PRIVATE_KEY_PATH -F /dev/null -o IdentitiesOnly=yes -o UserKnownHostsFile=$SSH_DIR/known_hosts -o StrictHostKeyChecking=accept-new"
+# Make both CLI and VS Code extension use the same SSH options
+export GIT_SSH_COMMAND="ssh -i $PRIVATE_KEY_PATH -F /dev/null -o IdentitiesOnly=yes -o UserKnownHostsFile=$SSH_DIR/known_hosts -o StrictHostKeyChecking=accept-new"
+git config --global core.sshCommand "$GIT_SSH_COMMAND"
 
 # -------- Always-on GitHub upload (idempotent) --------
-# Requires a PAT with permission to create user SSH keys (classic PAT scope: admin:public_key)
 if [ -n "${GH_PAT:-}" ]; then
-  # Normalize local key to "type key" (strip comment) for reliable comparison
   LOCAL_KEY="$(awk '{print $1" "$2}' "$PUBLIC_KEY_PATH")"
   TITLE="${GH_KEY_TITLE:-Docker SSH Key}"
 
   log "Checking if SSH key already exists on GitHub..."
   KEYS_JSON="$(curl -sS -H "Authorization: token ${GH_PAT}" -H "Accept: application/vnd.github+json" https://api.github.com/user/keys || true)"
-
   if echo "$KEYS_JSON" | grep -q "\"key\": *\"$LOCAL_KEY\""; then
     log "SSH key already present on GitHub; skipping upload"
   else
@@ -97,29 +90,39 @@ chmod 644 "$PUBLIC_KEY_PATH"  || true
 chmod 644 "$SSH_DIR/known_hosts" || true
 chown -R "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR"
 
-# -------- clone/pull helper --------
+# -------- helpers --------
 add_safe_dir() {
-  # add path as safe directory (idempotent)
-  p="$1"
-  [ -n "$p" ] || return 0
+  p="$1"; [ -n "$p" ] || return 0
   git config --global --add safe.directory "$p" || true
 }
 
-clone_one() {
+repair_repo() {
+  dest="$1"
+  [ -d "$dest/.git" ] || return 0
+
+  # Fix ownership & restrictive perms inside .git
+  chown -R "${PUID:-1000}:${PGID:-1000}" "$dest" || true
+  # Worktree files: ensure user can read/write/execute dirs
+  chmod -R u+rwX "$dest" || true
+  # .git internals should be private
+  find "$dest/.git" -type d -exec chmod 700 {} \; 2>/dev/null || true
+  find "$dest/.git" -type f -exec chmod 600 {} \; 2>/dev/null || true
+
+  # Remove stale lock files that block operations
+  for lf in index.lock config.lock HEAD.lock FETCH_HEAD.lock packed-refs.lock shallow.lock; do
+    [ -f "$dest/.git/$lf" ] && rm -f "$dest/.git/$lf" || true
+  done
+
+  # Add as safe directory
+  add_safe_dir "$dest"
+}
+
+# Normalize a repo spec into URL + dest name
+normalize_spec() {
   spec="$1"
-  [ -n "$spec" ] || return 0
-
-  # trim whitespace
-  spec=$(echo "$spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-  [ -n "$spec" ] || return 0
-
-  # parse optional '#branch'
   repo="$spec"; branch=""
-  case "$spec" in
-    *'#'*) branch="${spec#*#}"; repo="${spec%%#*}";;
-  esac
+  case "$spec" in *'#'*) branch="${spec#*#}"; repo="${spec%%#*}";; esac
 
-  # normalize -> SSH URL + target dir name
   case "$repo" in
     *"git@github.com:"*)
       url="$repo"
@@ -136,21 +139,35 @@ clone_one() {
       url="git@github.com:${repo}.git"
       ;;
     *)
-      log "skip invalid spec: $spec"
-      return 0
+      url=""; name=""
       ;;
   esac
+
+  echo "$url|$name|$branch"
+}
+
+clone_one() {
+  spec="$1"
+  [ -n "$spec" ] || return 0
+  spec="$(echo "$spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [ -n "$spec" ] || return 0
+
+  IFS='|' read -r url name branch <<EOF
+$(normalize_spec "$spec")
+EOF
+
+  if [ -z "$url" ] || [ -z "$name" ]; then
+    log "skip invalid spec: $spec"
+    return 0
+  fi
 
   dest="${BASE}/${name}"
   safe_url="$(echo "$url" | sed -E 's#(git@github\.com:).*#\1***.git#')"
 
-  # Ensure ownership first (fixes 'dubious ownership' if previous runs created as root)
+  # If repo dir exists, repair it before using git
   if [ -d "$dest" ]; then
-    chown -R "${PUID:-1000}:${PGID:-1000}" "$dest" || true
+    repair_repo "$dest"
   fi
-
-  # Always add safe.directory for this exact repo path (prevents 'dubious ownership')
-  add_safe_dir "$dest"
 
   if [ -d "$dest/.git" ]; then
     log "pull: ${name}"
@@ -168,13 +185,22 @@ clone_one() {
     else
       git clone "$url" "$dest" || { log "clone failed: $spec"; return 0; }
     fi
-    # After clone, ensure ownership and mark safe again (idempotent)
-    chown -R "${PUID:-1000}:${PGID:-1000}" "$dest" || true
-    add_safe_dir "$dest"
+    # After clone, make sure perms/safe are correct
+    repair_repo "$dest"
   fi
-} 
+}
 
-# -------- clone the list --------
+# -------- Phase 0: repair any repos that already exist in the volume --------
+# This catches repos not listed in GIT_REPOS but present from older runs too.
+if [ -d "$BASE" ]; then
+  for d in "$BASE"/*; do
+    [ -d "$d/.git" ] || continue
+    log "repair existing repo: $d"
+    repair_repo "$d"
+  done
+fi
+
+# -------- Phase 1: process the desired repo list --------
 if [ -n "${GIT_REPOS:-}" ]; then
   IFS=,; set -- $GIT_REPOS; unset IFS
   for spec in "$@"; do clone_one "$spec"; done

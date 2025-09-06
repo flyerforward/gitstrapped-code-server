@@ -17,7 +17,7 @@ services:
       - ./init/10-git.sh:/custom-cont-init.d/10-git.sh:ro
       - ./init/20-vscode-settings.sh:/custom-cont-init.d/20-vscode-settings.sh:ro
     ports:
-      - "8443:8443"
+      - ":8443"
     restart: unless-stopped
 
 volumes:

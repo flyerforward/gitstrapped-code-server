@@ -12,10 +12,7 @@ services:
       GIT_EMAIL: "${GIT_EMAIL}"      # optional (overrides auto-resolved email)
       GIT_REPOS: "${GIT_REPOS}"      # required list
       GIT_BASE_DIR: "/config/workspace"
-    volumes:
-      - code-config:/config
-      - projects:/config/workspace
-      - ./init/10-git.sh:/custom-cont-init.d/10-git.sh:ro
+
     volumes:
       - code-config:/config
       - projects:/config/workspace

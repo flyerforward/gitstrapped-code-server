@@ -172,7 +172,7 @@ clone_one() {
     chown -R "${PUID:-1000}:${PGID:-1000}" "$dest" || true
     add_safe_dir "$dest"
   fi
-}
+} 
 
 # -------- clone the list --------
 if [ -n "${GIT_REPOS:-}" ]; then

@@ -1,24 +1,28 @@
 #!/usr/bin/env sh
 set -eu
+CFG_DIR="/config/data/User"
+CFG_FILE="$CFG_DIR/settings.json"
 
-USER_DIR="/config/data/User"
-mkdir -p "$USER_DIR"
-SETTINGS="$USER_DIR/settings.json"
-
-cat > "$SETTINGS" <<'JSON'
+mkdir -p "$CFG_DIR"
+if [ ! -f "$CFG_FILE" ]; then
+  cat > "$CFG_FILE" <<'JSON'
 {
-  // Keep GitHub extensions from trying to own auth
-  "github.gitAuthentication": false,
-  "git.terminalAuthentication": false,
-
-  // Avoid Settings Sync login prompts
-  "settingsSync.enabled": false,
-
-  // Minor QoL
-  "git.confirmSync": false,
-  "extensions.ignoreRecommendations": true
+  "git.autoRepositoryDetection": true,
+  "git.repositoryScanMaxDepth": 4,
+  "git.openRepositoryInParentFolders": "always",
+  "security.workspace.trust.enabled": false,
+  "workbench.startupEditor": "none"
 }
 JSON
-
-chown -R "${PUID:-1000}:${PGID:-1000}" "$USER_DIR"
-echo "[vscode-settings] seeded $SETTINGS"
+  echo "[vscode-settings] seeded $CFG_FILE"
+else
+  # merge/patch minimal keys if file exists
+  tmp="$CFG_FILE.tmp.$$"
+  awk '
+    BEGIN{ set["git.autoRepositoryDetection"]=1; set["git.repositoryScanMaxDepth"]=1; set["git.openRepositoryInParentFolders"]=1; set["security.workspace.trust.enabled"]=1 }
+    { print } END{
+      print ""
+    }' "$CFG_FILE" > "$tmp" && mv "$tmp" "$CFG_FILE"
+  echo "[vscode-settings] left existing $CFG_FILE unchanged"
+fi
+chown -R "${PUID:-1000}:${PGID:-1000}" "/config/data"

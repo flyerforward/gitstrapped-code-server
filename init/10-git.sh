@@ -7,27 +7,23 @@ log "start"
 log "env: GIT_NAME='${GIT_NAME:-}' GIT_EMAIL='${GIT_EMAIL:-}'"
 log "env: GIT_REPOS='${GIT_REPOS:-}'"
 
-# LSIO 'abc' user's HOME is /config; ensure git writes configs there.
 export HOME=/config
-
-# Create readable files/dirs by default (prevents future NoPermissions surprises)
 umask 022
 
-# -------- workspace & git defaults --------
+# -------- workspace --------
 BASE="${GIT_BASE_DIR:-/config/workspace}"
 mkdir -p "$BASE" || true
 chown -R "${PUID:-1000}:${PGID:-1000}" "$BASE" || true
+git config --global --add safe.directory "$BASE" || true
 
+# -------- git defaults --------
 [ -n "${GIT_NAME:-}" ]  && git config --global user.name  "$GIT_NAME"  || true
 [ -n "${GIT_EMAIL:-}" ] && git config --global user.email "$GIT_EMAIL" || true
 git config --global init.defaultBranch main || true
 git config --global pull.ff only || true
 git config --global advice.detachedHead false || true
 
-# Add base as safe (we also add each repo path explicitly below)
-git config --global --add safe.directory "$BASE" || true
-
-# -------- SSH under /config/.ssh --------
+# -------- SSH --------
 SSH_DIR="/config/.ssh"
 KEY_NAME="id_ed25519"
 PRIVATE_KEY_PATH="$SSH_DIR/$KEY_NAME"
@@ -47,16 +43,13 @@ else
   log "SSH key already exists; skipping generation"
 fi
 
-# known_hosts + ssh options
 touch "$SSH_DIR/known_hosts"
 chmod 644 "$SSH_DIR/known_hosts"
 chown "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR/known_hosts"
-
 if command -v ssh-keyscan >/dev/null 2>&1; then
   grep -q "^github.com" "$SSH_DIR/known_hosts" 2>/dev/null || ssh-keyscan github.com >> "$SSH_DIR/known_hosts" 2>/dev/null || true
 fi
 
-# Make both CLI and VS Code extension use the same SSH options
 export GIT_SSH_COMMAND="ssh -i $PRIVATE_KEY_PATH -F /dev/null -o IdentitiesOnly=yes -o UserKnownHostsFile=$SSH_DIR/known_hosts -o StrictHostKeyChecking=accept-new"
 git config --global core.sshCommand "$GIT_SSH_COMMAND"
 
@@ -64,127 +57,76 @@ git config --global core.sshCommand "$GIT_SSH_COMMAND"
 if [ -n "${GH_PAT:-}" ]; then
   LOCAL_KEY="$(awk '{print $1" "$2}' "$PUBLIC_KEY_PATH")"
   TITLE="${GH_KEY_TITLE:-Docker SSH Key}"
-
   log "Checking if SSH key already exists on GitHub..."
   KEYS_JSON="$(curl -sS -H "Authorization: token ${GH_PAT}" -H "Accept: application/vnd.github+json" https://api.github.com/user/keys || true)"
   if echo "$KEYS_JSON" | grep -q "\"key\": *\"$LOCAL_KEY\""; then
     log "SSH key already present on GitHub; skipping upload"
   else
     log "Adding SSH key to GitHub via API..."
-    RESP="$(curl -sS -X POST \
-      -H "Authorization: token ${GH_PAT}" \
-      -H "Accept: application/vnd.github+json" \
-      -d "{\"title\":\"$TITLE\",\"key\":\"$LOCAL_KEY\"}" \
-      https://api.github.com/user/keys || true)"
-    if echo "$RESP" | grep -q '"id"'; then
-      log "SSH key added to GitHub"
-    else
-      log "Failed to add key: $RESP"
-    fi
+    RESP="$(curl -sS -X POST -H "Authorization: token ${GH_PAT}" -H "Accept: application/vnd.github+json" \
+      -d "{\"title\":\"$TITLE\",\"key\":\"$LOCAL_KEY\"}" https://api.github.com/user/keys || true)"
+    echo "$RESP" | grep -q '"id"' && log "SSH key added to GitHub" || log "Failed to add key: $RESP"
   fi
 else
   log "GH_PAT not set; skipping GitHub key upload"
 fi
 
-# Ensure permissions/ownership are solid for SSH area
-chmod 700 "$SSH_DIR"
-chmod 600 "$PRIVATE_KEY_PATH" || true
-chmod 644 "$PUBLIC_KEY_PATH"  || true
-chmod 644 "$SSH_DIR/known_hosts" || true
-chown -R "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR"
-
 # -------- helpers --------
-add_safe_dir() {
-  p="$1"; [ -n "$p" ] || return 0
-  git config --global --add safe.directory "$p" || true
-}
+add_safe_dir(){ git config --global --add safe.directory "$1" || true; }
 
-log_perms() {
+log_perms(){
   p="$1"; command -v namei >/dev/null 2>&1 || return 0
-  log "perms for $p:"
-  namei -mo "$p" 2>/dev/null | sed 's/^/[git-init]   /'
+  log "perms for $p:"; namei -mo "$p" 2>/dev/null | sed 's/^/[git-init]   /'
 }
 
-repair_repo() {
-  dest="$1"
-  [ -d "$dest/.git" ] || return 0
-
+repair_repo(){
+  dest="$1"; [ -d "$dest/.git" ] || return 0
   log "repair existing repo: $dest"
   chown -R "${PUID:-1000}:${PGID:-1000}" "$dest" || true
-
-  # Working tree (exclude .git): dirs 755, files 644
   if command -v find >/dev/null 2>&1; then
     find "$dest" -path "$dest/.git" -prune -o -type d -exec chmod 755 {} \; 2>/dev/null || true
     find "$dest" -path "$dest/.git" -prune -o -type f -exec chmod 644 {} \; 2>/dev/null || true
+    find "$dest/.git" -type d -exec chmod 700 {} \; 2>/dev/null || true
+    find "$dest/.git" -type f -exec chmod 600 {} \; 2>/dev/null || true
   else
     chmod -R u+rwX,go+rX "$dest" || true
   fi
-
-  # .git internals: dirs 700, files 600
-  if command -v find >/dev/null 2>&1; then
-    find "$dest/.git" -type d -exec chmod 700 {} \; 2>/dev/null || true
-    find "$dest/.git" -type f -exec chmod 600 {} \; 2>/dev/null || true
-  fi
-
-  # Remove stale lock files
   for lf in index.lock config.lock HEAD.lock FETCH_HEAD.lock packed-refs.lock shallow.lock; do
     [ -f "$dest/.git/$lf" ] && rm -f "$dest/.git/$lf" || true
   done
-
   add_safe_dir "$dest"
   log_perms "$dest"
 }
 
-normalize_spec() {
-  spec="$1"
-  repo="$spec"; branch=""
+normalize_spec(){
+  spec="$1"; repo="$spec"; branch=""
   case "$spec" in *'#'*) branch="${spec#*#}"; repo="${spec%%#*}";; esac
-
   case "$repo" in
-    *"git@github.com:"*)
-      url="$repo"
-      name="$(basename "$repo" .git)"
-      ;;
+    *"git@github.com:"*) url="$repo"; name="$(basename "$repo" .git)";;
     http*://github.com/*|ssh://git@github.com/*)
       name="$(basename "$repo" .git)"
       owner_repo="$(echo "$repo" | sed -E 's#^https?://github\.com/##; s#^ssh://git@github\.com/##')"
       owner_repo="${owner_repo%.git}"
       url="git@github.com:${owner_repo}.git"
       ;;
-    */*)
-      name="$(basename "$repo")"
-      url="git@github.com:${repo}.git"
-      ;;
-    *)
-      url=""; name=""
-      ;;
+    */*) name="$(basename "$repo")"; url="git@github.com:${repo}.git";;
+    *) url=""; name="";;
   esac
-
   echo "$url|$name|$branch"
 }
 
-clone_one() {
-  spec="$1"
-  [ -n "$spec" ] || return 0
-  spec="$(echo "$spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  [ -n "$spec" ] || return 0
+clone_one(){
+  spec="$1"; [ -n "$spec" ] || return 0
+  spec="$(echo "$spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"; [ -n "$spec" ] || return 0
 
   IFS='|' read -r url name branch <<EOF
 $(normalize_spec "$spec")
 EOF
+  if [ -z "$url" ] || [ -z "$name" ]; then log "skip invalid spec: $spec"; return 0; fi
 
-  if [ -z "$url" ] || [ -z "$name" ]; then
-    log "skip invalid spec: $spec"
-    return 0
-  fi
+  dest="${BASE}/${name}"; safe_url="$(echo "$url" | sed -E 's#(git@github\.com:).*#\1***.git#')"
 
-  dest="${BASE}/${name}"
-  safe_url="$(echo "$url" | sed -E 's#(git@github\.com:).*#\1***.git#')"
-
-  # If repo dir exists, repair it before using git
-  if [ -d "$dest" ]; then
-    repair_repo "$dest"
-  fi
+  [ -d "$dest" ] && repair_repo "$dest"
 
   if [ -d "$dest/.git" ]; then
     log "pull: ${name}"
@@ -204,9 +146,13 @@ EOF
     fi
     repair_repo "$dest"
   fi
+
+  # prove git sees it
+  git -C "$dest" rev-parse --is-inside-work-tree 2>&1 | sed 's/^/[git-init]   /' || true
+  git -C "$dest" rev-parse --git-dir             2>&1 | sed 's/^/[git-init]   /' || true
 }
 
-# -------- Phase 0: repair any repos that already exist in the volume --------
+# -------- Phase 0: repair any repos already in the volume --------
 if [ -d "$BASE" ]; then
   for d in "$BASE"/*; do
     [ -d "$d/.git" ] || continue
@@ -214,12 +160,46 @@ if [ -d "$BASE" ]; then
   done
 fi
 
-# -------- Phase 1: process the desired repo list --------
+# -------- Phase 1: process desired repos --------
+REPO_DIRS=""
 if [ -n "${GIT_REPOS:-}" ]; then
   IFS=,; set -- $GIT_REPOS; unset IFS
-  for spec in "$@"; do clone_one "$spec"; done
+  for spec in "$@"; do
+    spec="$(echo "$spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -z "$spec" ] || {
+      name="$(basename "$(echo "$spec" | sed 's/#.*$//')" .git)"
+      [ -n "$name" ] || name="repo"
+      REPO_DIRS="$REPO_DIRS $name"
+      clone_one "$spec"
+    }
+  done
 else
   log "GIT_REPOS is empty; nothing to clone"
 fi
+
+# -------- Phase 2: write a multi-root workspace file --------
+# This makes both repos show up in Source Control when opening this file.
+WS_FILE="$BASE/_dev.code-workspace"
+{
+  echo '{'
+  echo '  "folders": ['
+  first=1
+  for n in $REPO_DIRS; do
+    [ $first -eq 0 ] && echo '    ,'
+    echo "    { \"path\": \"./$n\" }"
+    first=0
+  done
+  echo '  ],'
+  echo '  "settings": {'
+  echo '    "git.autoRepositoryDetection": true,'
+  echo '    "git.repositoryScanMaxDepth": 4,'
+  echo '    "git.openRepositoryInParentFolders": "always",'
+  echo '    "security.workspace.trust.enabled": false'
+  echo '  }'
+  echo '}'
+} > "$WS_FILE"
+chown "${PUID:-1000}:${PGID:-1000}" "$WS_FILE"
+chmod 644 "$WS_FILE"
+log "wrote workspace: $WS_FILE"
 
 log "done"

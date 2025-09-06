@@ -1,0 +1,52 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Bootstrap GitHub Workspace",
+      "type": "shell",
+      "command": "/config/bin/bootstrap.sh",
+      "options": {
+        "env": {
+          "GH_USER": "${input:gh_user}",
+          "GH_PAT": "${input:gh_pat}",
+          "GIT_EMAIL": "${input:git_email}",
+          "GIT_NAME": "${input:git_name}",
+          "GIT_REPOS": "${input:git_repos}"  // leave blank to skip, or paste comma list
+        }
+      },
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "gh_user",
+      "type": "promptString",
+      "description": "GitHub username (required)",
+      "default": "${env:GH_USER}"
+    },
+    {
+      "id": "gh_pat",
+      "type": "promptString",
+      "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)",
+      "password": true
+    },
+    {
+      "id": "git_email",
+      "type": "promptString",
+      "description": "Git email (optional; leave empty to auto-detect)",
+      "default": ""
+    },
+    {
+      "id": "git_name",
+      "type": "promptString",
+      "description": "Git name (optional; default = GH_USER)",
+      "default": "${env:GIT_NAME}"
+    },
+    {
+      "id": "git_repos",
+      "type": "promptString",
+      "description": "Repos to clone (comma-separated owner/repo[#branch] or URLs)",
+      "default": "${env:GIT_REPOS}"
+    }
+  ]
+}

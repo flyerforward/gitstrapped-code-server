@@ -16,7 +16,7 @@ services:
     volumes:
       - code-config:/config
       - projects:/config/workspace
-      - ./bootstrap.sh:/config/bin/bootstrap.sh:ro
+      - ./config/bin/bootstrap.sh:/config/bin/bootstrap.sh:ro
       #- ./init/10-git.sh:/custom-cont-init.d/10-git.sh:ro
       - ./.vscode:/config/workspace/.vscode:ro 
     ports:

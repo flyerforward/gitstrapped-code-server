@@ -58,7 +58,7 @@ INPUTS_JSON='[
   { "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}" },
   { "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
 ]'
-# GLOBAL (no "when")
+# GLOBAL shortcut (no "when")
 KEYB_JSON='{
   "key": "ctrl+alt+g",
   "command": "workbench.action.tasks.runTask",
@@ -71,11 +71,24 @@ KEYB_JSON='{
 install_user_assets() {
   ensure_dir "$USER_DIR"
 
-  # Make sure files are valid JSON of expected shape (with jq); else create fresh.
+  # Normalize malformed keybindings.json (array required)
+  if [ -f "$KEYB_PATH" ] && command -v jq >/dev/null 2>&1; then
+    tmp="$(mktemp)"
+    if ! jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
+      cp "$KEYB_PATH" "$KEYB_PATH.bak"
+      printf '[]' > "$KEYB_PATH"
+    else
+      jq 'if type=="array" then . else [] end' "$KEYB_PATH" > "$tmp" && mv "$tmp" "$KEYB_PATH"
+    fi
+    chown "$PUID:$PGID" "$KEYB_PATH"
+  fi
+
   if command -v jq >/dev/null 2>&1; then
-    # ---- tasks.json (replace our task by label; replace each input by id) ----
+    # --- tasks.json merge (replace our task by label; inputs by id) ---
     if [ -f "$TASKS_PATH" ] && jq -e . "$TASKS_PATH" >/dev/null 2>&1; then
-      tmp="$(mktemp)"; printf "%s" "$TASK_JSON" > "$tmp.task"; printf "%s" "$INPUTS_JSON" > "$tmp.inputs"
+      tmp="$(mktemp)"
+      printf "%s" "$TASK_JSON"   > "$tmp.task"
+      printf "%s" "$INPUTS_JSON" > "$tmp.inputs"
       jq \
         --slurpfile newtask "$tmp.task" \
         --slurpfile newinputs "$tmp.inputs" '
@@ -86,19 +99,13 @@ install_user_assets() {
           | ($root.inputs // []) as $inputs
           | $root
           | .version = ( .version // "2.0.0" )
-          # Replace our task entirely by label (drop any old props)
-          | .tasks = (
-              ensureArr($tasks)
-              | map(select( (.label? // null) != $newtask[0].label))
-              | . + [ $newtask[0] ]
-            )
-          # Replace each input entirely by id (drop old props)
-          | .inputs = (
-              ensureArr($inputs)
-              | reduce $newinputs[0][] as $ni
-                  ( . ;
-                    map(select( (.id? // null) != $ni.id)) + [ $ni ] )
-            )
+          | .tasks  = ( ensureArr($tasks)
+                        | map(select(type=="object" and (.label? // null) != $newtask[0].label))
+                        + [ $newtask[0] ] )
+          | .inputs = ( ensureArr($inputs)
+                        | reduce $newinputs[0][] as $ni
+                            ( . ;
+                              map(select(type=="object" and (.id? // null) != $ni.id)) + [ $ni ] ) )
         ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
       rm -f "$tmp.task" "$tmp.inputs"
       chown "$PUID:$PGID" "$TASKS_PATH"
@@ -115,13 +122,13 @@ JSON
       log "created tasks.json → $TASKS_PATH"
     fi
 
-    # ---- keybindings.json (array; replace our binding entirely by key+command+args) ----
+    # --- keybindings.json merge (replace our binding by key+command+args) ---
     if [ -f "$KEYB_PATH" ] && jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
-      tmp="$(mktemp)"; printf "%s" "$KEYB_JSON" > "$tmp.kb"
+      tmp="$(mktemp)"
+      printf "%s" "$KEYB_JSON" > "$tmp.kb"
       jq --slurpfile kb "$tmp.kb" '
         def ensureArr(a): if (a|type)=="array" then a else [] end;
         (ensureArr(.)) as $arr
-        # Remove any entry that matches our (key+command+args), then append ours.
         | ( $arr
             | map(select(type=="object"))
             | map(select( (.key? // null)     != $kb[0].key
@@ -139,7 +146,7 @@ JSON
     fi
 
   else
-    # No jq → create-only (never overwrite user customizations)
+    # No jq → create-only (never overwrite)
     if [ ! -f "$TASKS_PATH" ]; then
       write_file "$TASKS_PATH" "$(cat <<JSON
 {
@@ -278,7 +285,7 @@ do_bootstrap(){
 
   if [ -n "${GIT_REPOS:-}" ]; then
     IFS=,; set -- $GIT_REPOS; unset IFS
-    for spec in "$@"; do clone_one "$spec"); done
+    for spec in "$@"; do clone_one "$spec"; done
   else
     log "GIT_REPOS empty; skip clone"
   fi

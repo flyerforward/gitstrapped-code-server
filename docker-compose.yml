@@ -14,6 +14,7 @@ services:
       GIT_BASE_DIR: "/config/workspace"
     volumes:
       - code-config:/config
+      - code-config:/config
       - projects:/config/workspace
       - ./init/10-bootstrap.sh:/custom-cont-init.d/10-bootstrap.sh:ro
     ports:

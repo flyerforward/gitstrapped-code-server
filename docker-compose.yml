@@ -6,11 +6,11 @@ services:
       PGID: "1000"
       TZ: "America/Toronto"
       PASSWORD: "${PASSWORD}"
-      # --- Git bootstrap (minimal) ---
-      GH_USER: "${GH_USER}"        # required (username)
-      GH_PAT: "${GH_PAT}"          # required (token; scopes: user:email, admin:public_key)
-      GIT_NAME: "${GIT_NAME}"      # optional; defaults to GH_USER if empty
-      GIT_REPOS: "${GIT_REPOS}"    # owner/repo[#branch] or https URLs, comma-separated
+      GH_USER: "${GH_USER}"          # required
+      GH_PAT: "${GH_PAT}"            # required (user:email, admin:public_key)
+      GIT_NAME: "${GIT_NAME}"        # optional (defaults to GH_USER)
+      GIT_EMAIL: "${GIT_EMAIL}"      # optional (overrides auto-resolved email)
+      GIT_REPOS: "${GIT_REPOS}"      # required list
       GIT_BASE_DIR: "/config/workspace"
     volumes:
       - code-config:/config

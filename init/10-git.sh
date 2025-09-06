@@ -6,10 +6,11 @@ redact(){ echo "$1" | sed 's/[A-Za-z0-9_\-]\{12,\}/***REDACTED***/g'; }
 
 log "start"
 log "env: GH_USER='${GH_USER:-}'"
-log "env: GIT_NAME='${GIT_NAME:-}(optional)'" 
+log "env: GIT_NAME='${GIT_NAME:-}(optional)'"
+log "env: GIT_EMAIL='${GIT_EMAIL:-}(optional override)'"
 log "env: GIT_REPOS='${GIT_REPOS:-}'"
 
-# Sanity checks
+# --- Required inputs ---
 if [ -z "${GH_USER:-}" ]; then
   log "ERROR: GH_USER is required."
   exit 1
@@ -32,48 +33,39 @@ if [ -z "${GIT_NAME:-}" ]; then
   GIT_NAME="$GH_USER"
 fi
 
-# Resolve GIT_EMAIL (no env needed): try API -> public email -> noreply
+# Resolve email from GH if not provided via env
 resolve_email(){
-  # 1) Auth user emails (needs scope user:email). Prefer primary verified.
+  # 1) /user/emails (requires classic PAT scope user:email). Prefer primary, then verified.
   EMAILS="$(curl -fsS \
     -H "Authorization: token ${GH_PAT}" \
     -H "Accept: application/vnd.github+json" \
     https://api.github.com/user/emails || true)"
 
-  # pick primary:true
   PRIMARY="$(printf "%s" "$EMAILS" | awk -F'"' '
     /"email":/ {e=$4}
     /"primary": *true/ {print e; exit}
   ')"
+  [ -n "$PRIMARY" ] && { echo "$PRIMARY"; return 0; }
 
-  if [ -n "$PRIMARY" ]; then
-    echo "$PRIMARY"; return 0
-  fi
-
-  # fallback: first verified:true
   VERIFIED="$(printf "%s" "$EMAILS" | awk -F'"' '
     /"email":/ {e=$4}
     /"verified": *true/ {print e; exit}
   ')"
-  if [ -n "$VERIFIED" ]; then
-    echo "$VERIFIED"; return 0
-  fi
+  [ -n "$VERIFIED" ] && { echo "$VERIFIED"; return 0; }
 
-  # 2) Public email on profile (may be null)
-  PUB_JSON="$(curl -fsS \
-    -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/users/${GH_USER}" || true)"
+  # 2) Public profile email (may be null)
+  PUB_JSON="$(curl -fsS -H "Accept: application/vnd.github+json" "https://api.github.com/users/${GH_USER}" || true)"
   PUB_EMAIL="$(printf "%s" "$PUB_JSON" | awk -F'"' '/"email":/ {print $4; exit}')"
-  if [ -n "$PUB_EMAIL" ] && [ "$PUB_EMAIL" != "null" ]; then
-    echo "$PUB_EMAIL"; return 0
-  fi
+  [ -n "$PUB_EMAIL" ] && [ "$PUB_EMAIL" != "null" ] && { echo "$PUB_EMAIL"; return 0; }
 
-  # 3) Final fallback: GitHub noreply (covers private-email setups)
+  # 3) Fallback to noreply
   echo "${GH_USER}@users.noreply.github.com"
 }
 
-GIT_EMAIL="$(resolve_email || true)"
-log "resolved email: ${GIT_EMAIL}"
+if [ -z "${GIT_EMAIL:-}" ]; then
+  GIT_EMAIL="$(resolve_email || true)"
+fi
+log "final git identity: name='${GIT_NAME}' email='${GIT_EMAIL}'"
 
 # Git config
 [ -n "${GIT_NAME:-}" ]  && git config --global user.name  "$GIT_NAME"  || true
@@ -119,14 +111,13 @@ fi
 git config --global core.sshCommand \
   "ssh -i $PRIVATE_KEY_PATH -F /dev/null -o IdentitiesOnly=yes -o UserKnownHostsFile=$SSH_DIR/known_hosts -o StrictHostKeyChecking=accept-new"
 
-# -------- Always-on GitHub upload (idempotent) --------
+# -------- Always-on GitHub key upload (idempotent) --------
 # Requires classic PAT scope: admin:public_key
 if [ -n "${GH_PAT:-}" ]; then
   LOCAL_KEY="$(awk '{print $1" "$2}' "$PUBLIC_KEY_PATH")"
   TITLE="${GH_KEY_TITLE:-Docker SSH Key}"
 
   log "Checking if SSH key already exists on GitHub..."
-  # (Do not log PAT)
   KEYS_JSON="$(curl -fsS \
     -H "Authorization: token ${GH_PAT}" \
     -H "Accept: application/vnd.github+json" \
@@ -163,14 +154,17 @@ clone_one() {
   spec="$1"
   [ -n "$spec" ] || return 0
 
+  # trim whitespace
   spec=$(echo "$spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
   [ -n "$spec" ] || return 0
 
+  # parse optional '#branch'
   repo="$spec"; branch=""
   case "$spec" in
     *'#'*) branch="${spec#*#}"; repo="${spec%%#*}";;
   esac
 
+  # normalize -> SSH URL + target dir name
   case "$repo" in
     *"git@github.com:"*)
       url="$repo"

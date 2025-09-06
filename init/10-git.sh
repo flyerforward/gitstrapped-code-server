@@ -10,6 +10,9 @@ log "env: GIT_REPOS='${GIT_REPOS:-}'"
 # LSIO 'abc' user's HOME is /config; ensure git writes configs there.
 export HOME=/config
 
+# Create readable files/dirs by default (prevents future NoPermissions surprises)
+umask 022
+
 # -------- workspace & git defaults --------
 BASE="${GIT_BASE_DIR:-/config/workspace}"
 mkdir -p "$BASE" || true
@@ -21,7 +24,7 @@ git config --global init.defaultBranch main || true
 git config --global pull.ff only || true
 git config --global advice.detachedHead false || true
 
-# Add base as safe (we'll add each repo path explicitly too)
+# Add base as safe (we also add each repo path explicitly below)
 git config --global --add safe.directory "$BASE" || true
 
 # -------- SSH under /config/.ssh --------
@@ -83,7 +86,7 @@ else
   log "GH_PAT not set; skipping GitHub key upload"
 fi
 
-# Ensure permissions/ownership are solid
+# Ensure permissions/ownership are solid for SSH area
 chmod 700 "$SSH_DIR"
 chmod 600 "$PRIVATE_KEY_PATH" || true
 chmod 644 "$PUBLIC_KEY_PATH"  || true
@@ -96,28 +99,42 @@ add_safe_dir() {
   git config --global --add safe.directory "$p" || true
 }
 
+log_perms() {
+  p="$1"; command -v namei >/dev/null 2>&1 || return 0
+  log "perms for $p:"
+  namei -mo "$p" 2>/dev/null | sed 's/^/[git-init]   /'
+}
+
 repair_repo() {
   dest="$1"
   [ -d "$dest/.git" ] || return 0
 
-  # Fix ownership & restrictive perms inside .git
+  log "repair existing repo: $dest"
   chown -R "${PUID:-1000}:${PGID:-1000}" "$dest" || true
-  # Worktree files: ensure user can read/write/execute dirs
-  chmod -R u+rwX "$dest" || true
-  # .git internals should be private
-  find "$dest/.git" -type d -exec chmod 700 {} \; 2>/dev/null || true
-  find "$dest/.git" -type f -exec chmod 600 {} \; 2>/dev/null || true
 
-  # Remove stale lock files that block operations
+  # Working tree (exclude .git): dirs 755, files 644
+  if command -v find >/dev/null 2>&1; then
+    find "$dest" -path "$dest/.git" -prune -o -type d -exec chmod 755 {} \; 2>/dev/null || true
+    find "$dest" -path "$dest/.git" -prune -o -type f -exec chmod 644 {} \; 2>/dev/null || true
+  else
+    chmod -R u+rwX,go+rX "$dest" || true
+  fi
+
+  # .git internals: dirs 700, files 600
+  if command -v find >/dev/null 2>&1; then
+    find "$dest/.git" -type d -exec chmod 700 {} \; 2>/dev/null || true
+    find "$dest/.git" -type f -exec chmod 600 {} \; 2>/dev/null || true
+  fi
+
+  # Remove stale lock files
   for lf in index.lock config.lock HEAD.lock FETCH_HEAD.lock packed-refs.lock shallow.lock; do
     [ -f "$dest/.git/$lf" ] && rm -f "$dest/.git/$lf" || true
   done
 
-  # Add as safe directory
   add_safe_dir "$dest"
+  log_perms "$dest"
 }
 
-# Normalize a repo spec into URL + dest name
 normalize_spec() {
   spec="$1"
   repo="$spec"; branch=""
@@ -185,17 +202,14 @@ EOF
     else
       git clone "$url" "$dest" || { log "clone failed: $spec"; return 0; }
     fi
-    # After clone, make sure perms/safe are correct
     repair_repo "$dest"
   fi
 }
 
 # -------- Phase 0: repair any repos that already exist in the volume --------
-# This catches repos not listed in GIT_REPOS but present from older runs too.
 if [ -d "$BASE" ]; then
   for d in "$BASE"/*; do
     [ -d "$d/.git" ] || continue
-    log "repair existing repo: $d"
     repair_repo "$d"
   done
 fi

@@ -6,8 +6,8 @@ services:
       PGID: "1000"
       TZ: "America/Toronto"
       PASSWORD: "${PASSWORD}"
-      GH_USER: "${GH_USER}"          # optional for auto-run; required for manual run
-      GH_PAT: "${GH_PAT}"            # optional for auto-run; required for manual run
+      GH_USER: "${GH_USER}"        # optional for autorun; required for manual task
+      GH_PAT: "${GH_PAT}"          # optional for autorun; required for manual task
       GIT_NAME: "${GIT_NAME}"
       GIT_EMAIL: "${GIT_EMAIL}"
       GIT_REPOS: "${GIT_REPOS}"
@@ -15,8 +15,7 @@ services:
     volumes:
       - code-config:/config
       - projects:/config/workspace
-      - ./bootstrap.sh:/config/bin/bootstrap.sh:ro
-      - ./init/00-bootstrap-on-start.sh:/custom-cont-init.d/00-bootstrap-on-start.sh:ro
+      - ./init/10-bootstrap.sh:/custom-cont-init.d/10-bootstrap.sh:ro
     ports:
       - ":8443"
     restart: always

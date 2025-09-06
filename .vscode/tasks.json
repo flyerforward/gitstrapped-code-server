@@ -4,14 +4,15 @@
     {
       "label": "Bootstrap GitHub Workspace",
       "type": "shell",
-      "command": "/config/bin/bootstrap.sh",
+      "command": "sh",
+      "args": ["/config/bin/bootstrap.sh"],
       "options": {
         "env": {
           "GH_USER": "${input:gh_user}",
           "GH_PAT": "${input:gh_pat}",
           "GIT_EMAIL": "${input:git_email}",
           "GIT_NAME": "${input:git_name}",
-          "GIT_REPOS": "${input:git_repos}"  // leave blank to skip, or paste comma list
+          "GIT_REPOS": "${input:git_repos}"
         }
       },
       "problemMatcher": []

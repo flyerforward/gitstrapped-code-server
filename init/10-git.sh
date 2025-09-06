@@ -10,22 +10,22 @@ log "env: GIT_REPOS='${GIT_REPOS:-}'"
 # The LSIO 'abc' user's HOME is /config; ensure git writes configs there.
 export HOME=/config
 
+# -------- workspace & git defaults --------
 BASE="${GIT_BASE_DIR:-/config/workspace}"
 mkdir -p "$BASE" || true
 chown -R "${PUID:-1000}:${PGID:-1000}" "$BASE" || true
 
-# Safer defaults + identity
 [ -n "${GIT_NAME:-}" ]  && git config --global user.name  "$GIT_NAME"  || true
 [ -n "${GIT_EMAIL:-}" ] && git config --global user.email "$GIT_EMAIL" || true
 git config --global init.defaultBranch main || true
 git config --global pull.ff only || true
 git config --global advice.detachedHead false || true
 
-# Mark workspace as safe for git (avoids "detected dubious ownership" when root touched files)
+# Mark workspace as safe (avoids 'dubious ownership' warnings)
 git config --global --add safe.directory "$BASE"
 git config --global --add safe.directory "$BASE/*"
 
-# ---- SSH setup under /config/.ssh (NOT /root) ----
+# -------- SSH under /config/.ssh (non-root) --------
 SSH_DIR="/config/.ssh"
 KEY_NAME="id_ed25519"
 PRIVATE_KEY_PATH="$SSH_DIR/$KEY_NAME"
@@ -36,49 +36,58 @@ mkdir -p "$SSH_DIR"
 chown -R "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
+# Generate key if missing
 if [ ! -f "$PRIVATE_KEY_PATH" ]; then
-  log "Generating new SSH key pair at $PRIVATE_KEY_PATH"
+  log "Generating SSH key at $PRIVATE_KEY_PATH"
   ssh-keygen -t ed25519 -f "$PRIVATE_KEY_PATH" -N "" -C "${GIT_EMAIL:-git@github.com}"
   chmod 600 "$PRIVATE_KEY_PATH"
   chmod 644 "$PUBLIC_KEY_PATH"
-
-  # Add GitHub to known_hosts to prevent host key prompt
-  touch "$SSH_DIR/known_hosts"
-  ssh-keyscan github.com >> "$SSH_DIR/known_hosts" 2>/dev/null || true
-  chmod 644 "$SSH_DIR/known_hosts"
-
-  # Upload the SSH public key to GitHub (if GH_PAT provided)
-  if [ -n "${GH_PAT:-}" ]; then
-    SSH_PUBLIC_KEY=$(cat "$PUBLIC_KEY_PATH")
-    log "Adding SSH key to GitHub via API..."
-    RESPONSE=$(curl -sS -X POST -H "Authorization: token ${GH_PAT}" \
-      -H "Accept: application/vnd.github+json" \
-      -d '{"title":"Docker SSH Key","key":"'"$SSH_PUBLIC_KEY"'"}' \
-      "https://api.github.com/user/keys" || true)
-    echo "$RESPONSE" | grep -q '"id"' && log "SSH key added to GitHub" || log "Failed to add key: $RESPONSE"
-  else
-    log "GH_PAT not set; skipping GitHub key upload"
-  fi
 else
   log "SSH key already exists; skipping generation"
-  # Ensure known_hosts exists and has GitHub
-  touch "$SSH_DIR/known_hosts"
-  grep -q "github.com" "$SSH_DIR/known_hosts" 2>/dev/null || ssh-keyscan github.com >> "$SSH_DIR/known_hosts" 2>/dev/null || true
-  chmod 644 "$SSH_DIR/known_hosts"
 fi
 
-# Ensure ownership for abc (PUID/PGID)
+# Ensure known_hosts exists and has GitHub; accept-new as fallback
+touch "$SSH_DIR/known_hosts"
+chmod 644 "$SSH_DIR/known_hosts"
+chown "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR/known_hosts"
+
+# Pre-seed GitHub host key if ssh-keyscan is available (best-effort)
+if command -v ssh-keyscan >/dev/null 2>&1; then
+  if ! grep -q "^github.com" "$SSH_DIR/known_hosts" 2>/dev/null; then
+    ssh-keyscan github.com >> "$SSH_DIR/known_hosts" 2>/dev/null || true
+  fi
+fi
+
+# Force git/ssh to use our key + known_hosts, with safe first-connection behavior
+git config --global core.sshCommand \
+  "ssh -i $PRIVATE_KEY_PATH -F /dev/null -o IdentitiesOnly=yes -o UserKnownHostsFile=$SSH_DIR/known_hosts -o StrictHostKeyChecking=accept-new"
+
+# Upload public key to GitHub if GH_PAT provided
+if [ -n "${GH_PAT:-}" ]; then
+  SSH_PUBLIC_KEY="$(cat "$PUBLIC_KEY_PATH")"
+  log "Adding SSH key to GitHub via API..."
+  RESPONSE=$(curl -sS -X POST -H "Authorization: token ${GH_PAT}" \
+    -H "Accept: application/vnd.github+json" \
+    -d '{"title":"Docker SSH Key","key":"'"$SSH_PUBLIC_KEY"'"}' \
+    "https://api.github.com/user/keys" || true)
+  echo "$RESPONSE" | grep -q '"id"' && log "SSH key added to GitHub" || log "Failed to add key: $RESPONSE"
+else
+  log "GH_PAT not set; skipping GitHub key upload"
+fi
+
+# Ensure permissions/ownership are solid
+chmod 700 "$SSH_DIR"
+chmod 600 "$PRIVATE_KEY_PATH" || true
+chmod 644 "$PUBLIC_KEY_PATH"  || true
+chmod 644 "$SSH_DIR/known_hosts" || true
 chown -R "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR"
 
-# Tell git to use this key explicitly (no agent required)
-git config --global core.sshCommand "ssh -i $PRIVATE_KEY_PATH -F /dev/null -o IdentitiesOnly=yes"
-
-# ---- Clone/pull helper ----
+# -------- clone/pull helper --------
 clone_one() {
   spec="$1"
   [ -n "$spec" ] || return 0
 
-  # trim
+  # trim whitespace
   spec=$(echo "$spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
   [ -n "$spec" ] || return 0
 
@@ -88,14 +97,13 @@ clone_one() {
     *'#'*) branch="${spec#*#}"; repo="${spec%%#*}";;
   esac
 
-  # build URL + dest (SSH preferred)
+  # normalize -> SSH URL + target dir name
   case "$repo" in
     *"git@github.com:"*)
       url="$repo"
       name="$(basename "$repo" .git)"
       ;;
     http*://github.com/*|ssh://git@github.com/*)
-      # transform https to ssh
       name="$(basename "$repo" .git)"
       owner_repo="$(echo "$repo" | sed -E 's#^https?://github\.com/##; s#^ssh://git@github\.com/##')"
       owner_repo="${owner_repo%.git}"
@@ -135,7 +143,7 @@ clone_one() {
   chown -R "${PUID:-1000}:${PGID:-1000}" "$dest" || true
 }
 
-# Split comma-separated GIT_REPOS and clone
+# -------- clone the list --------
 if [ -n "${GIT_REPOS:-}" ]; then
   IFS=,; set -- $GIT_REPOS; unset IFS
   for spec in "$@"; do clone_one "$spec"; done

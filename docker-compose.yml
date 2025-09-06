@@ -6,16 +6,16 @@ services:
       PGID: "1000"
       TZ: "America/Toronto"
       PASSWORD: "${PASSWORD}"
-      GIT_NAME: "${GIT_NAME}"
-      GIT_EMAIL: "${GIT_EMAIL}"
-      GIT_REPOS: "${GIT_REPOS}"
+      # --- Git bootstrap (minimal) ---
+      GH_USER: "${GH_USER}"        # required (username)
+      GH_PAT: "${GH_PAT}"          # required (token; scopes: user:email, admin:public_key)
+      GIT_NAME: "${GIT_NAME}"      # optional; defaults to GH_USER if empty
+      GIT_REPOS: "${GIT_REPOS}"    # owner/repo[#branch] or https URLs, comma-separated
       GIT_BASE_DIR: "/config/workspace"
-      GH_PAT: "${GH_PAT}"
     volumes:
-      - code-config:/config                 # abc's HOME
+      - code-config:/config
       - projects:/config/workspace
       - ./init/10-git.sh:/custom-cont-init.d/10-git.sh:ro
-      - ./init/20-vscode-settings.sh:/custom-cont-init.d/20-vscode-settings.sh:ro
     ports:
       - ":8443"
     restart: always

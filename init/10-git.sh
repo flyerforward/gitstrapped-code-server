@@ -2,10 +2,22 @@
 set -eu
 
 log(){ echo "[git-init] $*"; }
+redact(){ echo "$1" | sed 's/[A-Za-z0-9_\-]\{12,\}/***REDACTED***/g'; }
 
 log "start"
-log "env: GIT_NAME='${GIT_NAME:-}' GIT_EMAIL='${GIT_EMAIL:-}'"
+log "env: GH_USER='${GH_USER:-}'"
+log "env: GIT_NAME='${GIT_NAME:-}(optional)'" 
 log "env: GIT_REPOS='${GIT_REPOS:-}'"
+
+# Sanity checks
+if [ -z "${GH_USER:-}" ]; then
+  log "ERROR: GH_USER is required."
+  exit 1
+fi
+if [ -z "${GH_PAT:-}" ]; then
+  log "ERROR: GH_PAT is required."
+  exit 1
+fi
 
 # LSIO 'abc' user's HOME is /config; ensure git writes configs there.
 export HOME=/config
@@ -15,12 +27,60 @@ BASE="${GIT_BASE_DIR:-/config/workspace}"
 mkdir -p "$BASE" || true
 chown -R "${PUID:-1000}:${PGID:-1000}" "$BASE" || true
 
+# Derive GIT_NAME if not provided: fallback to GH_USER
+if [ -z "${GIT_NAME:-}" ]; then
+  GIT_NAME="$GH_USER"
+fi
+
+# Resolve GIT_EMAIL (no env needed): try API -> public email -> noreply
+resolve_email(){
+  # 1) Auth user emails (needs scope user:email). Prefer primary verified.
+  EMAILS="$(curl -fsS \
+    -H "Authorization: token ${GH_PAT}" \
+    -H "Accept: application/vnd.github+json" \
+    https://api.github.com/user/emails || true)"
+
+  # pick primary:true
+  PRIMARY="$(printf "%s" "$EMAILS" | awk -F'"' '
+    /"email":/ {e=$4}
+    /"primary": *true/ {print e; exit}
+  ')"
+
+  if [ -n "$PRIMARY" ]; then
+    echo "$PRIMARY"; return 0
+  fi
+
+  # fallback: first verified:true
+  VERIFIED="$(printf "%s" "$EMAILS" | awk -F'"' '
+    /"email":/ {e=$4}
+    /"verified": *true/ {print e; exit}
+  ')"
+  if [ -n "$VERIFIED" ]; then
+    echo "$VERIFIED"; return 0
+  fi
+
+  # 2) Public email on profile (may be null)
+  PUB_JSON="$(curl -fsS \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/users/${GH_USER}" || true)"
+  PUB_EMAIL="$(printf "%s" "$PUB_JSON" | awk -F'"' '/"email":/ {print $4; exit}')"
+  if [ -n "$PUB_EMAIL" ] && [ "$PUB_EMAIL" != "null" ]; then
+    echo "$PUB_EMAIL"; return 0
+  fi
+
+  # 3) Final fallback: GitHub noreply (covers private-email setups)
+  echo "${GH_USER}@users.noreply.github.com"
+}
+
+GIT_EMAIL="$(resolve_email || true)"
+log "resolved email: ${GIT_EMAIL}"
+
+# Git config
 [ -n "${GIT_NAME:-}" ]  && git config --global user.name  "$GIT_NAME"  || true
 [ -n "${GIT_EMAIL:-}" ] && git config --global user.email "$GIT_EMAIL" || true
 git config --global init.defaultBranch main || true
 git config --global pull.ff only || true
 git config --global advice.detachedHead false || true
-# Mark workspace as safe (avoids 'dubious ownership' warnings)
 git config --global --add safe.directory "$BASE"
 git config --global --add safe.directory "$BASE/*"
 
@@ -50,32 +110,33 @@ touch "$SSH_DIR/known_hosts"
 chmod 644 "$SSH_DIR/known_hosts"
 chown "${PUID:-1000}:${PGID:-1000}" "$SSH_DIR/known_hosts"
 
-# Pre-seed GitHub host key if ssh-keyscan is available (best-effort)
 if command -v ssh-keyscan >/dev/null 2>&1; then
   if ! grep -q "^github.com" "$SSH_DIR/known_hosts" 2>/dev/null; then
     ssh-keyscan github.com >> "$SSH_DIR/known_hosts" 2>/dev/null || true
   fi
 fi
 
-# Force git/ssh to use our key + known_hosts, with safe first-connection behavior
 git config --global core.sshCommand \
   "ssh -i $PRIVATE_KEY_PATH -F /dev/null -o IdentitiesOnly=yes -o UserKnownHostsFile=$SSH_DIR/known_hosts -o StrictHostKeyChecking=accept-new"
 
 # -------- Always-on GitHub upload (idempotent) --------
-# Requires a PAT with permission to create user SSH keys (classic PAT scope: admin:public_key)
+# Requires classic PAT scope: admin:public_key
 if [ -n "${GH_PAT:-}" ]; then
-  # Normalize local key to "type key" (strip comment) for reliable comparison
   LOCAL_KEY="$(awk '{print $1" "$2}' "$PUBLIC_KEY_PATH")"
   TITLE="${GH_KEY_TITLE:-Docker SSH Key}"
 
   log "Checking if SSH key already exists on GitHub..."
-  KEYS_JSON="$(curl -sS -H "Authorization: token ${GH_PAT}" -H "Accept: application/vnd.github+json" https://api.github.com/user/keys || true)"
+  # (Do not log PAT)
+  KEYS_JSON="$(curl -fsS \
+    -H "Authorization: token ${GH_PAT}" \
+    -H "Accept: application/vnd.github+json" \
+    https://api.github.com/user/keys || true)"
 
   if echo "$KEYS_JSON" | grep -q "\"key\": *\"$LOCAL_KEY\""; then
     log "SSH key already present on GitHub; skipping upload"
   else
     log "Adding SSH key to GitHub via API..."
-    RESP="$(curl -sS -X POST \
+    RESP="$(curl -fsS -X POST \
       -H "Authorization: token ${GH_PAT}" \
       -H "Accept: application/vnd.github+json" \
       -d "{\"title\":\"$TITLE\",\"key\":\"$LOCAL_KEY\"}" \
@@ -83,7 +144,7 @@ if [ -n "${GH_PAT:-}" ]; then
     if echo "$RESP" | grep -q '"id"'; then
       log "SSH key added to GitHub"
     else
-      log "Failed to add key: $RESP"
+      log "Failed to add key: $(redact "$RESP")"
     fi
   fi
 else
@@ -102,17 +163,14 @@ clone_one() {
   spec="$1"
   [ -n "$spec" ] || return 0
 
-  # trim whitespace
   spec=$(echo "$spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
   [ -n "$spec" ] || return 0
 
-  # parse optional '#branch'
   repo="$spec"; branch=""
   case "$spec" in
     *'#'*) branch="${spec#*#}"; repo="${spec%%#*}";;
   esac
 
-  # normalize -> SSH URL + target dir name
   case "$repo" in
     *"git@github.com:"*)
       url="$repo"

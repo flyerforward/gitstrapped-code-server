@@ -4,15 +4,17 @@ set -eu
 log(){ echo "[bootstrap] $*"; }
 redact(){ echo "$1" | sed 's/[A-Za-z0-9_\-]\{12,\}/***REDACTED***/g'; }
 
-export HOME=/config
+# ---------------------------
+# CONSTANTS / PATHS
+# ---------------------------
+export HOME=/config                # linuxserver 'abc' home
 PUID="${PUID:-1000}"
 PGID="${PGID:-1000}"
 
-# Candidate user-data locations (covering code-server variants)
-USER_CANDIDATES="
-/config/.local/share/code-server/User
-/config/data/User
-"
+# Use the active code-server user-data dir (your build logs show this path)
+USER_DIR="/config/data/User"
+TASKS_PATH="$USER_DIR/tasks.json"
+KEYB_PATH="$USER_DIR/keybindings.json"
 
 BASE="${GIT_BASE_DIR:-/config/workspace}"
 SSH_DIR="/config/.ssh"
@@ -20,10 +22,19 @@ KEY_NAME="id_ed25519"
 PRIVATE_KEY_PATH="$SSH_DIR/$KEY_NAME"
 PUBLIC_KEY_PATH="$SSH_DIR/${KEY_NAME}.pub"
 
-LOCK_DIR="/run/bootstrap"; mkdir -p "$LOCK_DIR" 2>/dev/null || true
+LOCK_DIR="/run/bootstrap"
 LOCK_FILE="$LOCK_DIR/autorun.lock"
+mkdir -p "$LOCK_DIR" 2>/dev/null || true
 
-# ---- payloads (task, inputs, keybinding) ----
+# ---------------------------
+# UTILS
+# ---------------------------
+ensure_dir(){ mkdir -p "$1"; chown -R "$PUID:$PGID" "$1"; }
+write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
+
+# ---------------------------
+# TASK / KEYBINDING PAYLOADS
+# ---------------------------
 TASK_LABEL="Bootstrap GitHub Workspace"
 TASK_JSON='{
   "label": "Bootstrap GitHub Workspace",
@@ -55,213 +66,53 @@ KEYB_JSON='{
   "when": "editorTextFocus"
 }'
 
-# ---------- helpers ----------
-ensure_dir() { mkdir -p "$1"; chown -R "$PUID:$PGID" "$1"; }
-write_file() { printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
-append_json_array_item() {
-  # $1=file, $2=item-json
-  # naive but safe: if the file is a JSON array, append; else create array with item
-  if [ ! -s "$1" ]; then
-    printf "[%s]\n" "$2" > "$1"
-    return 0
-  fi
-  if grep -q '^\s*\[' "$1"; then
-    # remove trailing ] then append with comma if necessary, then ]
-    # handle existing trailing spaces/newlines
-    tmp="$(mktemp)"
-    # if array already empty → just insert item; else insert comma then item
-    if grep -q '\[[[:space:]]*\]' "$1"; then
-      sed 's/\[[[:space:]]*\]/[ '"$2"' ]/' "$1" > "$tmp"
-    else
-      # add comma before closing ]
-      sed '$!b; s/][[:space:]]*$/\n]/' "$1" > "$tmp" # normalize final bracket newline
-      # check if last non-space char before closing ] is '[' or something else
-      if tail -n 1 "$1" | grep -q ']' ; then :; fi
-      # add comma+item before last ]
-      awk -v RS= -v ORS= -v item="$2" '
-        { sub(/\][[:space:]]*$/, ", " item "\n]"); print }
-      ' "$tmp" > "$1"
-      rm -f "$tmp"
-      return 0
-    fi
-    mv "$tmp" "$1"
-  else
-    # not an array → wrap into array with original preserved as second element (best-effort)
-    tmp="$(mktemp)"
-    printf "[%s]\n" "$2" > "$tmp"
-    mv "$tmp" "$1"
-  fi
-}
-
-merge_tasks_nojq() {
-  # $1=tasks.json path
-  f="$1"
-  if [ ! -s "$f" ]; then
-    write_file "$f" "$(cat <<JSON
-{
-  "version": "2.0.0",
-  "tasks": [ $TASK_JSON ],
-  "inputs": $INPUTS_JSON
-}
-JSON
-)"
-    log "created tasks.json → $f"
-    return
-  fi
-
-  # If our task label already present, we won't duplicate; ensure inputs exist
-  if grep -q "\"label\"[[:space:]]*:[[:space:]]*\"$TASK_LABEL\"" "$f"; then
-    # ensure inputs array contains our 5 inputs by id; if not present, append simplest way:
-    if ! grep -q '"id"[[:space:]]*:[[:space:]]*"gh_user"' "$f"; then
-      # naive append: if "inputs" exists and is an array, append our INPUTS_JSON items; else create
-      if grep -q '"inputs"[[:space:]]*:' "$f"; then
-        # Try to replace "inputs": [...] with our union (very rough). Safer path: backup + recreate minimal.
-        cp "$f" "$f.bak"
-        # Extract existing inputs block end and append; fallback to overwrite minimal acceptable structure
-        # Minimal safe fallback (don’t break existing tasks): keep tasks array, reset inputs to our INPUTS_JSON
-        tasks_block="$(awk 'BEGIN{p=0} /"tasks"[[:space:]]*:/ {p=1} p{print} /\][[:space:]]*,?[[:space:]]*"inputs"/{exit}' "$f" 2>/dev/null || true)"
-        if [ -n "$tasks_block" ]; then
-          write_file "$f" "$(cat <<JSON
-{
-  "version": "2.0.0",
-  "tasks": $(echo "$tasks_block" | sed -n 's/^[^{]*"tasks"[[:space:]]*:[[:space:]]*\(.*\)$/\1/p' | sed 's/,"inputs".*$//'),
-  "inputs": $INPUTS_JSON
-}
-JSON
-)"
-        fi
-      else
-        # add an inputs array
-        cp "$f" "$f.bak"
-        sed -i 's/}[[:space:]]*$/,\n  "inputs": '"$INPUTS_JSON"'\n}/' "$f" || true
-      fi
-    fi
-    log "updated tasks.json (no jq): ensured inputs for Bootstrap task → $f"
-    return
-  fi
-
-  # Our task missing → append into tasks array or create minimal file
-  if grep -q '"tasks"[[:space:]]*:' "$f"; then
-    # Try to append into existing tasks array (best-effort)
-    cp "$f" "$f.bak"
-    # If tasks array is empty, replace [] with [ $TASK_JSON ]; else inject before closing ]
-    if grep -q '"tasks"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]' "$f"; then
-      sed -i 's/"tasks"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]/"tasks": [ '"$TASK_JSON"' ]/' "$f"
-    else
-      # insert before the last ] of the tasks array – very rough heuristic:
-      awk -v RS= -v ORS= -v task="$TASK_JSON" '
-        {
-          # naive: find "tasks": [ ... ]; insert , task before its matching ]
-          sub(/"tasks"[[:space:]]*:[[:space:]]*\[/, "&"); 
-          gsub(/\n/, "\n");
-          # not robust JSON parsing; best-effort append near end of file:
-        }1
-      ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-      # If append failed, fall back to minimal rewrite preserving tasks array content via grep/sed isn’t reliable.
-      # So as a safety net, rebuild a minimal valid file:
-      if ! grep -q "$TASK_LABEL" "$f"; then
-        tasks_block="$(sed -n '/"tasks"[[:space:]]*:/,$p' "$f" | sed -n '1,/]/p' | sed '1!s/^[^{]*"tasks"[[:space:]]*:[[:space:]]*//')"
-        [ -n "$tasks_block" ] || tasks_block='[]'
-        # Insert our task into the array text
-        if echo "$tasks_block" | grep -q '^\s*\[\s*\]\s*$'; then
-          tasks_new="[ $TASK_JSON ]"
-        else
-          tasks_new="$(echo "$tasks_block" | sed -E 's/\][[:space:]]*$/ , '"$TASK_JSON"' ]/')"
-        fi
-        write_file "$f" "$(cat <<JSON
-{
-  "version": "2.0.0",
-  "tasks": $tasks_new,
-  "inputs": $INPUTS_JSON
-}
-JSON
-)"
-      fi
-    fi
-  else
-    # No tasks section → minimal structure
-    write_file "$f" "$(cat <<JSON
-{
-  "version": "2.0.0",
-  "tasks": [ $TASK_JSON ],
-  "inputs": $INPUTS_JSON
-}
-JSON
-)"
-  fi
-  log "appended Bootstrap task to tasks.json (no jq) → $f"
-}
-
-merge_keybindings_nojq() {
-  # $1=keybindings.json path
-  f="$1"
-  if [ ! -s "$f" ]; then
-    write_file "$f" "$(printf '[%s]\n' "$KEYB_JSON")"
-    log "created keybindings.json → $f"
-    return
-  fi
-  # Already present?
-  if grep -q '"command"[[:space:]]*:[[:space:]]*"workbench.action.tasks.runTask"[[:space:]]*,' "$f" \
-     && grep -q '"args"[[:space:]]*:[[:space:]]*"'"$TASK_LABEL"'"' "$f"; then
-    log "keybinding already present → $f"
-    return
-  fi
-  # Append into array (best-effort)
-  if head -n1 "$f" | grep -q '^\s*\['; then
-    tmp="$(mktemp)"
-    cp "$f" "$tmp"
-    # empty array?
-    if grep -q '^\s*\[\s*\]\s*$' "$f"; then
-      printf '[ %s ]\n' "$KEYB_JSON" > "$f"
-    else
-      # add comma+item before trailing ]
-      awk -v RS= -v ORS= -v item="$KEYB_JSON" '
-        { sub(/\][[:space:]]*$/, ", " item "\n]"); print }
-      ' "$tmp" > "$f"
-    fi
-    rm -f "$tmp"
-    chown "$PUID:$PGID" "$f"
-    log "appended Bootstrap keybinding (no jq) → $f"
-  else
-    # Not an array → replace with our array (safer than corrupting)
-    write_file "$f" "$(printf '[%s]\n' "$KEYB_JSON")"
-    log "replaced malformed keybindings with valid array containing Bootstrap → $f"
-  fi
-}
-
+# ---------------------------
+# INSTALL/MERGE USER ASSETS
+# ---------------------------
 install_user_assets() {
-  for USER_DIR in $USER_CANDIDATES; do
-    TASKS_PATH="$USER_DIR/tasks.json"
-    KEYB_PATH="$USER_DIR/keybindings.json"
-    ensure_dir "$USER_DIR"
+  ensure_dir "$USER_DIR"
 
-    if command -v jq >/dev/null 2>&1; then
-      # --- tasks (jq) ---
-      if [ -f "$TASKS_PATH" ]; then
-        tmp="$(mktemp)"
-        printf "%s" "$TASK_JSON" > "$tmp.task"
-        printf "%s" "$INPUTS_JSON" > "$tmp.inputs"
-        jq \
-          --slurpfile newtask "$tmp.task" \
-          --slurpfile newinputs "$tmp.inputs" '
-            ( . // {} ) as $root
-            | ($root.tasks // []) as $tasks
-            | ($root.inputs // []) as $inputs
-            | $root
-            | .version = ( .version // "2.0.0" )
-            | .tasks = ( ($tasks | map(select(.label != $newtask[0].label))) + [ $newtask[0] ] )
-            | .inputs = (
-                reduce $newinputs[0][] as $ni (
-                  ($inputs // []);
-                  ( map(select(.id != $ni.id)) + [ $ni ] )
-                )
-              )
-          ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
-        rm -f "$tmp.task" "$tmp.inputs"
-        chown "$PUID:$PGID" "$TASKS_PATH"
-        log "merged (jq) task → $TASKS_PATH"
-      else
-        write_file "$TASKS_PATH" "$(cat <<JSON
+  # Normalize malformed keybindings.json (array required)
+  if [ -f "$KEYB_PATH" ] && command -v jq >/dev/null 2>&1; then
+    tmp="$(mktemp)"
+    if ! jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
+      cp "$KEYB_PATH" "$KEYB_PATH.bak"
+      printf '[]' > "$KEYB_PATH"
+    else
+      jq 'if type=="array" then . else [] end' "$KEYB_PATH" > "$tmp" && mv "$tmp" "$KEYB_PATH"
+    fi
+    chown "$PUID:$PGID" "$KEYB_PATH"
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    # --- tasks.json merge (robust) ---
+    if [ -f "$TASKS_PATH" ]; then
+      tmp="$(mktemp)"
+      printf "%s" "$TASK_JSON"   > "$tmp.task"
+      printf "%s" "$INPUTS_JSON" > "$tmp.inputs"
+      jq \
+        --slurpfile newtask "$tmp.task" \
+        --slurpfile newinputs "$tmp.inputs" '
+          def ensureObj(o): if (o|type)=="object" then o else {} end;
+          def ensureArr(a): if (a|type)=="array"  then a else [] end;
+          (ensureObj(.)) as $root
+          | ($root.tasks  // []) as $tasks
+          | ($root.inputs // []) as $inputs
+          | $root
+          | .version = ( .version // "2.0.0" )
+          | .tasks  = ( ensureArr($tasks)
+                        | map(select(type=="object" and (.label? // null) != $newtask[0].label))
+                        + [ $newtask[0] ] )
+          | .inputs = ( ensureArr($inputs)
+                        | reduce $newinputs[0][] as $ni
+                            ( . ;
+                              map(select(type=="object" and (.id? // null) != $ni.id)) + [ $ni ] ) )
+        ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
+      rm -f "$tmp.task" "$tmp.inputs"
+      chown "$PUID:$PGID" "$TASKS_PATH"
+      log "merged task → $TASKS_PATH"
+    else
+      write_file "$TASKS_PATH" "$(cat <<JSON
 {
   "version": "2.0.0",
   "tasks": [ $TASK_JSON ],
@@ -269,39 +120,59 @@ install_user_assets() {
 }
 JSON
 )"
-        log "created tasks.json → $TASKS_PATH"
-      fi
-
-      # --- keybindings (jq) ---
-      if [ -f "$KEYB_PATH" ]; then
-        tmp="$(mktemp)"
-        printf "%s" "$KEYB_JSON" > "$tmp.kb"
-        jq --slurpfile kb "$tmp.kb" '
-          ( . // [] ) as $arr
-          | ( $arr | map(select(.command != $kb[0].command or .args != $kb[0].args)) )
-            + [ $kb[0] ]
-        ' "$KEYB_PATH" > "$tmp.out" && mv "$tmp.out" "$KEYB_PATH"
-        rm -f "$tmp.kb"
-        chown "$PUID:$PGID" "$KEYB_PATH"
-        log "merged (jq) keybinding → $KEYB_PATH"
-      else
-        write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
-        log "created keybindings.json → $KEYB_PATH"
-      fi
-
-    else
-      # No jq: conservative append/create
-      merge_tasks_nojq "$TASKS_PATH"
-      chown "$PUID:$PGID" "$TASKS_PATH"
-      merge_keybindings_nojq "$KEYB_PATH"
-      chown "$PUID:$PGID" "$KEYB_PATH"
+      log "created tasks.json → $TASKS_PATH"
     fi
-  done
 
-  log "Installed/merged Task + keybinding in user dirs above."
-  log "If you don't see them yet, run: Command Palette → Developer: Reload Window."
+    # --- keybindings.json merge (robust) ---
+    if [ -f "$KEYB_PATH" ]; then
+      tmp="$(mktemp)"
+      printf "%s" "$KEYB_JSON" > "$tmp.kb"
+      jq --slurpfile kb "$tmp.kb" '
+        def ensureArr(a): if (a|type)=="array" then a else [] end;
+        (ensureArr(.)) as $arr
+        | ( $arr
+            | map(select(type=="object"))
+            | map(select( (.command? // null) != $kb[0].command
+                          or (.args?    // null) != $kb[0].args))
+          )
+          + [ $kb[0] ]
+      ' "$KEYB_PATH" > "$tmp.out" && mv "$tmp.out" "$KEYB_PATH"
+      rm -f "$tmp.kb"
+      chown "$PUID:$PGID" "$KEYB_PATH"
+      log "merged keybinding → $KEYB_PATH"
+    else
+      write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
+      log "created keybindings.json → $KEYB_PATH"
+    fi
+
+  else
+    # No jq: create-only, never overwrite user customizations
+    if [ ! -f "$TASKS_PATH" ]; then
+      write_file "$TASKS_PATH" "$(cat <<JSON
+{
+  "version": "2.0.0",
+  "tasks": [ $TASK_JSON ],
+  "inputs": $INPUTS_JSON
+}
+JSON
+)"
+      log "created tasks.json (no jq) → $TASKS_PATH"
+    else
+      log "jq not found; tasks.json exists → skipping merge to preserve user customizations."
+    fi
+
+    if [ ! -f "$KEYB_PATH" ]; then
+      write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
+      log "created keybindings.json (no jq) → $KEYB_PATH"
+    else
+      log "jq not found; keybindings.json exists → skipping merge to preserve user customizations."
+    fi
+  fi
 }
 
+# ---------------------------
+# BOOTSTRAP
+# ---------------------------
 resolve_email(){
   EMAILS="$(curl -fsS -H "Authorization: token ${GH_PAT}" -H "Accept: application/vnd.github+json" https://api.github.com/user/emails || true)"
   PRIMARY="$(printf "%s" "$EMAILS" | awk -F'"' '/"email":/ {e=$4} /"primary": *true/ {print e; exit}')"
@@ -422,14 +293,11 @@ do_bootstrap(){
   log "bootstrap done"
 }
 
-# ---------- run ----------
-# Always install/merge the Task + keybinding into both candidate paths
-for u in $USER_CANDIDATES; do
-  ensure_dir "$u"
-done
+# ---------------------------
+# RUN
+# ---------------------------
 install_user_assets
 
-# Auto-run bootstrap once per start if env present
 if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ]; then
   if [ ! -f "$LOCK_FILE" ]; then
     : > "$LOCK_FILE" || true
@@ -442,9 +310,4 @@ else
   log "GH_USER/GH_PAT missing → skip autorun (use Ctrl+Alt+G or Tasks: Run Task)"
 fi
 
-# Friendly hint for visibility
-log "User task + keybinding installed under:"
-for u in $USER_CANDIDATES; do
-  echo " - $u"
-done
-log "Reload code-server window to pick up changes (Cmd/Ctrl+Shift+P → Developer: Reload Window)."
+log "Task + keybinding installed under: $USER_DIR (reload window if not visible)"

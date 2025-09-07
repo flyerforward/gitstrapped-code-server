@@ -16,9 +16,9 @@ TASKS_PATH="$USER_DIR/tasks.json"
 KEYB_PATH="$USER_DIR/keybindings.json"
 SETTINGS_PATH="$USER_DIR/settings.json"
 
-STATE_DIR="/config/.bootstrap"
+STATE_DIR="/config/bootstrap"
 MANAGED_KEYS_FILE="$STATE_DIR/managed-settings-keys.json"
-REPO_SETTINGS_SRC="$STATE_DIR/bootstrap-settings.json"   # mount ./settings.json -> /config/.bootstrap/bootstrap-settings.json:ro
+REPO_SETTINGS_SRC="$STATE_DIR/bootstrap-settings.json"   # mount ./settings.json -> /config/bootstrap/bootstrap-settings.json:ro
 
 BASE="${GIT_BASE_DIR:-/config/workspace}"
 SSH_DIR="/config/.ssh"

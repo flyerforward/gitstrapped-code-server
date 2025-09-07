@@ -38,18 +38,6 @@ mkdir -p "$LOCK_DIR" 2>/dev/null || true
 ensure_dir(){ mkdir -p "$1"; chown -R "$PUID:$PGID" "$1" 2>/dev/null || true; }
 write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1" 2>/dev/null || true; }
 
-# Strip JSONC-ish stuff -> JSON (best-effort, safe for jq)
-jsonc_to_json() {
-  # in -> out
-  in="$1"; out="$2"
-  # Remove /* block comments */
-  sed -E ':a; s@/\*([^*]|\*+[^*/])*\*/@@g; ta' "$in" \
-  | sed -E 's@^[[:space:]]*//.*$@@' \            # Remove // full-line comments
-  | sed -E 's/[[:space:]]*#[[:space:]]*$//' \     # Strip trailing # comments
-  | sed -E ':b; s/,\s*([}\]])/\1/g; tb' \         # Remove trailing commas
-  | sed -E '/^[[:space:]]*$/d' > "$out"
-}
-
 # ---------------------------
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
@@ -145,41 +133,40 @@ JSON
 
     # --- keybindings.json merge (ONLY our binding; per-property '#' retention) ---
     if [ -f "$KEYB_PATH" ]; then
-      # 1) Collect retained property names FROM OUR BINDING ONLY
+      # 1) Determine retained property names (lines ending with '#') within our binding
       RETAIN_KEYS_JSON="[]"
       if [ -s "$KEYB_PATH" ]; then
         RETAIN_KEYS_JSON="$(
           awk '
             BEGIN{depth=0; ours=0; saw_cmd=0}
             {
-              # crude brace counting suitable for keybindings structures
-              # count { and }
               nopen=gsub(/{/,"{"); nclose=gsub(/}/,"}");
+              # enter a new object when depth goes 0->1
               if (depth==0 && nopen>0) { ours=0; saw_cmd=0 }
-              # detect our binding by name or legacy command+args
-              if (depth==1 && match($0,/"name"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/)) { ours=1 }
-              if (depth==1 && match($0,/"command"[[:space:]]*:[[:space:]]*"workbench\.action\.tasks\.runTask"/)) { saw_cmd=1 }
-              if (depth==1 && saw_cmd && match($0,/"args"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/)) { ours=1 }
+              # detect our binding by name or legacy command+args while inside an object (depth==1)
+              if (depth==1 && $0 ~ /"name"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/) { ours=1 }
+              if (depth==1 && $0 ~ /"command"[[:space:]]*:[[:space:]]*"workbench\.action\.tasks\.runTask"/) { saw_cmd=1 }
+              if (depth==1 && saw_cmd==1 && $0 ~ /"args"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/) { ours=1 }
               # if ours, capture prop names whose line ends with #
               if (depth==1 && ours==1) {
                 if ($0 ~ /^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$/) {
-                  if (match($0,/^[[:space:]]*"([^"]+)"[[:space:]]*:/,m)) print m[1];
+                  match($0,/^[[:space:]]*"([^"]+)"[[:space:]]*:/,m);
+                  if (m[1]!="") print m[1];
                 }
               }
-              depth += nopen - nclose
+              depth += nopen - nclose;
               if (depth<0) depth=0
             }
           ' "$KEYB_PATH" | jq -R -s 'split("\n") | map(select(length>0))'
         )"
       fi
 
-      # 2) Clean JSONC to JSON so jq can parse safely; if parsing still fails, skip merge to avoid clobbering
+      # 2) Create a cleaned temp (strip trailing '#') so jq can parse; if parsing fails, skip merge to avoid clobber
       CLEAN_KB="$(mktemp)"
-      jsonc_to_json "$KEYB_PATH" "$CLEAN_KB"
+      sed 's/[[:space:]]*#[[:space:]]*$//' "$KEYB_PATH" > "$CLEAN_KB"
       if ! jq -e . "$CLEAN_KB" >/dev/null 2>&1; then
-        log "WARNING: keybindings.json could not be parsed after cleaning; skipping keybinding merge to avoid overwriting."
+        log "WARNING: keybindings.json not parseable → skipping keybinding merge"
       else
-        # 3) Merge: keep all user bindings; for our binding, update only non-retained props
         tmp="$(mktemp)"
         printf "%s" "$KEYB_JSON" > "$tmp.kb"
         jq \

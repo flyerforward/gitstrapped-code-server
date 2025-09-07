@@ -84,7 +84,7 @@ install_user_assets() {
   if [ -f "$KEYB_PATH" ] && command -v jq >/dev/null 2>&1; then
     tmp="$(mktemp)"
     if ! jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
-      cp "$KEYB_PATH" "$KEYB_PATH.bak"
+      cp "$KEYB_PATH" "$KEYB_PATH.bak" 2>/dev/null || true
       printf '[]' > "$KEYB_PATH"
     else
       jq 'if type=="array" then . else [] end' "$KEYB_PATH" > "$tmp" && mv "$tmp" "$KEYB_PATH"
@@ -131,33 +131,118 @@ JSON
       log "created tasks.json → $TASKS_PATH"
     fi
 
-    # --- keybindings.json merge (replace ONLY our binding by name; keep user bindings) ---
-    if [ -f "$KEYB_PATH" ] && jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
-      tmp="$(mktemp)"
-      printf "%s" "$KEYB_JSON" > "$tmp.kb"
-      jq --slurpfile kb "$tmp.kb" '
-        def ensureArr(a): if (a|type)=="array" then a else [] end;
-        (ensureArr(.)) as $arr
-        | (
-            $arr
-            | map(select(type=="object"))
-            # Keep everything EXCEPT any entry that is our bootstrap binding:
-            #  - Preferred match: .name equals ours
-            #  - Legacy cleanup: command+args equals ours (older versions without "name")
-            | map(select( (
-                            ((.name? // "") == $kb[0].name)
-                            or ( ((.command? // "") == $kb[0].command) and ((.args? // "") == $kb[0].args) )
-                          ) | not ))
-          )
-          + [ $kb[0] ]
-      ' "$KEYB_PATH" > "$tmp.out" && mv "$tmp.out" "$KEYB_PATH"
-      rm -f "$tmp.kb"
-      chown "$PUID:$PGID" "$KEYB_PATH"
-      log "merged keybindings.json (only our binding updated; user bindings preserved) → $KEYB_PATH"
-    else
-      write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
-      log "created keybindings.json → $KEYB_PATH"
+    # --- keybindings.json merge (respect user-pinned fields with "#") ---
+    if [ -f "$KEYB_PATH" ]; then
+      cp "$KEYB_PATH" "$KEYB_PATH.bak" 2>/dev/null || true
     fi
+
+    # 1) Read raw (may contain '#'), detect which fields are pinned near our binding
+    KEYB_RAW="$(cat "$KEYB_PATH" 2>/dev/null || printf '[]')"
+
+    # Find (approx) line of our binding's name
+    name_line="$(printf "%s\n" "$KEYB_RAW" | nl -ba | grep -n '"name"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"' | head -n1 | cut -d: -f1 || true)"
+    pinned_key="0"; pinned_command="0"; pinned_args="0"; pinned_name="0"
+    if [ -n "${name_line:-}" ]; then
+      # scan a small window around the name line to catch the binding’s object
+      start=$(( name_line > 12 ? name_line-12 : 1 ))
+      end=$(( name_line+12 ))
+      window="$(printf "%s\n" "$KEYB_RAW" | sed -n "${start},${end}p")"
+
+      echo "$window" | grep -E '"key"[[:space:]]*:'     | grep -q '#' && pinned_key="1" || true
+      echo "$window" | grep -E '"command"[[:space:]]*:' | grep -q '#' && pinned_command="1" || true
+      echo "$window" | grep -E '"args"[[:space:]]*:'    | grep -q '#' && pinned_args="1" || true
+      echo "$window" | grep -E '"name"[[:space:]]*:'    | grep -q '#' && pinned_name="1" || true
+    fi
+
+    # 2) Strip everything after a literal '#' on each line (to make it valid JSON for jq)
+    #    (Only for parsing/merging; we’ll re-add markers later.)
+    KEYB_STRIPPED="$(printf "%s\n" "$KEYB_RAW" | sed 's/#.*$//')"
+
+    # Ensure it parses to an array; if not, coerce to []
+    if ! printf "%s" "$KEYB_STRIPPED" | jq -e . >/dev/null 2>&1; then
+      KEYB_STRIPPED='[]'
+    fi
+    KEYB_STRIPPED="$(printf "%s" "$KEYB_STRIPPED" | jq 'if type=="array" then . else [] end')"
+
+    # 3) Build our template object (from KEYB_JSON) and (optionally) take old values for pinned fields
+    tmp="$(mktemp)"
+    printf "%s" "$KEYB_STRIPPED" > "$tmp.arr"
+    printf "%s" "$KEYB_JSON"     > "$tmp.template"
+
+    # Extract the existing binding (stripped) if present
+    printf "%s" "$KEYB_STRIPPED" > "$tmp.clean"
+    old_obj="$(jq -c '
+      map(select(type=="object"))
+      | map(select((.name? // "")=="Bootstrap GitHub Workspace"
+                   or (((.command? // "")=="workbench.action.tasks.runTask")
+                      and ((.args? // "")=="Bootstrap GitHub Workspace"))))
+      | .[-1] // {}' "$tmp.clean")"
+
+    # Apply preservation: for any field flagged as pinned, copy from old_obj
+    jq --argjson tmpl "$(cat "$tmp.template")" \
+       --argjson old  "$old_obj" \
+       --arg pk "$pinned_key" \
+       --arg pc "$pinned_command" \
+       --arg pa "$pinned_args" \
+       --arg pn "$pinned_name" \
+       '
+       def asObj(x): if (x|type)=="object" then x else {} end;
+       def maybe(old,tmpl,field,flag):
+         if (flag=="1" and (old[field]? != null)) then
+           (tmpl[field] = old[field])
+         else
+           tmpl
+         end;
+
+       (asObj($tmpl)) as $t
+       | (asObj($old))  as $o
+       | $t
+       | maybe($o; .; "key";     $pk)
+       | maybe($o; .; "command"; $pc)
+       | maybe($o; .; "args";    $pa)
+       | maybe($o; .; "name";    $pn)
+       ' > "$tmp.final_obj"
+
+    # Now merge: drop any previous occurrence of our binding (by name, or legacy command+args), append the new one
+    jq --slurpfile newkb "$tmp.final_obj" '
+      def ensureArr(a): if (a|type)=="array" then a else [] end;
+      (ensureArr(.)) as $arr
+      | (
+          $arr
+          | map(select(type=="object"))
+          | map(select( ((.name? // "") == $newkb[0].name)
+                        or (((.command? // "")=="workbench.action.tasks.runTask")
+                            and ((.args? // "")=="Bootstrap GitHub Workspace")) | not ))
+        )
+        + [ $newkb[0] ]
+    ' "$tmp.arr" > "$tmp.out" && mv "$tmp.out" "$KEYB_PATH"
+    chown "$PUID:$PGID" "$KEYB_PATH"
+
+    # 4) Re-add trailing " #"(hash) markers for any fields that were pinned
+    # We add the marker to the end of the line with that field inside the object with our "name".
+    # (jq pretty-prints so lines exist; we only append if not already present.)
+    if [ "$pinned_key" = "1" ] || [ "$pinned_command" = "1" ] || [ "$pinned_args" = "1" ] || [ "$pinned_name" = "1" ]; then
+      awk '
+        BEGIN { inobj=0; want=0; pk='"$pinned_key"'; pc='"$pinned_command"'; pa='"$pinned_args"'; pn='"$pinned_name"' }
+        {
+          line=$0
+          if (line ~ /"name"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/) { want=1 }
+          if (want && index(line, "{")) { inobj=1 }
+          if (inobj) {
+            if (pk==1 && line ~ /"key"[[:space:]]*:/ && line !~ /#/)      { sub(/[[:space:]]*$/, " #", line) }
+            if (pc==1 && line ~ /"command"[[:space:]]*:/ && line !~ /#/)  { sub(/[[:space:]]*$/, " #", line) }
+            if (pa==1 && line ~ /"args"[[:space:]]*:/ && line !~ /#/)     { sub(/[[:space:]]*$/, " #", line) }
+            if (pn==1 && line ~ /"name"[[:space:]]*:/ && line !~ /#/)     { sub(/[[:space:]]*$/, " #", line) }
+          }
+          print line
+          if (inobj && index(line, "}")) { inobj=0; want=0 }
+        }
+      ' "$KEYB_PATH" > "$tmp.hash" && mv "$tmp.hash" "$KEYB_PATH"
+      chown "$PUID:$PGID" "$KEYB_PATH"
+    fi
+
+    rm -f "$tmp" "$tmp.arr" "$tmp.template" "$tmp.clean" "$tmp.final_obj" "$tmp.out" "$tmp.hash" 2>/dev/null || true
+    log "merged keybindings.json (preserved #-pinned fields; user bindings kept) → $KEYB_PATH"
 
   else
     # No jq → create-only (never overwrite)
@@ -216,7 +301,7 @@ install_settings_from_repo() {
   # Ensure user settings is an object
   if [ -f "$SETTINGS_PATH" ]; then
     if ! jq -e . "$SETTINGS_PATH" >/dev/null 2>&1; then
-      cp "$SETTINGS_PATH" "$SETTINGS_PATH.bak"
+      cp "$SETTINGS_PATH" "$SETTINGS_PATH.bak" 2>/dev/null || true
       printf "{}" > "$SETTINGS_PATH"
     else
       tmp="$(mktemp)"; jq 'if type=="object" then . else {} end' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"

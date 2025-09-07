@@ -125,13 +125,12 @@ install_keybinding() {
   fi
 
   # 1) Detect retained properties (lines ending with '#') inside the Bootstrap binding
-  #    We capture prop names only within that object by a quick brace-depth scan.
   RETAIN_KEYS_JSON="$(
     awk '
       BEGIN{depth=0; ours=0}
       {
-        line=$0
-        nopen=gsub(/{/,"{"); nclose=gsub(/}/,"}");
+        line=$0; sub(/\r$/,"",line);                             # strip CR if present
+        nopen=gsub(/{/,"{",line); nclose=gsub(/}/,"}",line);
         if (depth==0 && nopen>0) { ours=0 }
         if (depth==1 && line ~ /"name"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/) { ours=1 }
         if (ours==1 && depth==1 && line ~ /^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$/) {
@@ -151,7 +150,7 @@ install_keybinding() {
     return 0
   fi
 
-  # 3) Merge: replace/insert our binding; copy values for retained props from the old binding.
+  # 3) Merge: replace/insert our binding; copy values for retained props from old binding.
   tmp="$(mktemp)"; printf "%s" "$KEYB_JSON" > "$tmp.kb"
   jq \
     --slurpfile kb "$tmp.kb" \
@@ -182,11 +181,12 @@ install_keybinding() {
     awk -v keys_re="$RE_KEYS_RE" '
       BEGIN{depth=0; ours=0}
       {
-        line=$0
-        nopen=gsub(/{/,"{"); nclose=gsub(/}/,"}");
+        line=$0; sub(/\r$/,"",line);                             # strip CR if present
+        nopen=gsub(/{/,"{",line); nclose=gsub(/}/,"}",line);
         if (depth==0 && nopen>0) { ours=0 }
         if (depth==1 && line ~ /"name"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/) { ours=1 }
         if (ours==1 && depth==1 && match(line, "^[[:space:]]*\\\"" keys_re "\\\"[[:space:]]*:")) {
+          # add a trailing " #" if not already present
           if (line !~ /#[[:space:]]*$/) { sub(/[[:space:]]*$/, " #", line) }
           print line
         } else {

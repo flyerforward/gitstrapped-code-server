@@ -76,8 +76,7 @@ KEYB_JSON='{
 install_tasks() {
   ensure_dir "$USER_DIR"
   if command -v jq >/dev/null 2>&1 && [ -f "$TASKS_PATH" ] && jq -e . "$TASKS_PATH" >/dev/null 2>&1; then
-    tmp="$(mktemp)"; printf "%s" "$TASK_JSON" > "$tmp.task"
-    printf "%s" "$INPUTS_JSON" > "$tmp.inputs"
+    tmp="$(mktemp)"; printf "%s" "$TASK_JSON" > "$tmp.task"; printf "%s" "$INPUTS_JSON" > "$tmp.inputs"
     jq \
       --slurpfile newtask "$tmp.task" \
       --slurpfile newinputs "$tmp.inputs" '
@@ -113,7 +112,7 @@ JSON
 }
 
 # ---------------------------
-# INSTALL KEYBINDING (safe merge + # retention)
+# INSTALL KEYBINDING (safe merge + retain + restore #)
 # ---------------------------
 install_keybinding() {
   ensure_dir "$USER_DIR"
@@ -125,24 +124,34 @@ install_keybinding() {
     return 0
   fi
 
-  # Collect per-property retention markers (any prop line ending with #)
+  # 1) Detect retained properties (lines ending with '#') inside the Bootstrap binding
+  #    We capture prop names only within that object by a quick brace-depth scan.
   RETAIN_KEYS_JSON="$(
-    grep -E '^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$' "$KEYB_PATH" 2>/dev/null \
-      | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' \
-      | jq -R -s 'split("\n") | map(select(length>0)) | unique'
+    awk '
+      BEGIN{depth=0; ours=0}
+      {
+        line=$0
+        nopen=gsub(/{/,"{"); nclose=gsub(/}/,"}");
+        if (depth==0 && nopen>0) { ours=0 }
+        if (depth==1 && line ~ /"name"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/) { ours=1 }
+        if (ours==1 && depth==1 && line ~ /^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$/) {
+          if (match(line,/^[[:space:]]*"([^"]+)"[[:space:]]*:/,m)) { print m[1] }
+        }
+        depth += nopen - nclose; if (depth<0) depth=0
+      }
+    ' "$KEYB_PATH" 2>/dev/null | jq -R -s 'split("\n") | map(select(length>0)) | unique'
   )"
 
-  # Make a cleaned temp by stripping trailing '#' (so jq can parse)
+  # 2) Clean to a temp for parsing (strip trailing # only); if parsing fails, skip to avoid clobbering.
   CLEAN_KB="$(mktemp)"
   sed 's/[[:space:]]*#[[:space:]]*$//' "$KEYB_PATH" > "$CLEAN_KB"
-
-  # If still not valid JSON, skip merge (do NOT overwrite the file).
   if ! command -v jq >/dev/null 2>&1 || ! jq -e . "$CLEAN_KB" >/dev/null 2>&1; then
     log "WARNING: keybindings.json not parseable; skipping keybinding merge to avoid overwrite."
     rm -f "$CLEAN_KB"
     return 0
   fi
 
+  # 3) Merge: replace/insert our binding; copy values for retained props from the old binding.
   tmp="$(mktemp)"; printf "%s" "$KEYB_JSON" > "$tmp.kb"
   jq \
     --slurpfile kb "$tmp.kb" \
@@ -166,10 +175,33 @@ install_keybinding() {
           + [ $merged ] )
   ' "$CLEAN_KB" > "${CLEAN_KB}.out"
 
+  # 4) Restore trailing ` #` on retained properties inside our binding in the final file.
+  RE_KEYS_RE="$(printf '%s' "${RETAIN_KEYS_JSON:-[]}" | jq -r 'map(gsub("\\\\.";"\\\\\\.")) | join("|")')"
+  if [ -n "$RE_KEYS_RE" ]; then
+    RESTORED="$(mktemp)"
+    awk -v keys_re="$RE_KEYS_RE" '
+      BEGIN{depth=0; ours=0}
+      {
+        line=$0
+        nopen=gsub(/{/,"{"); nclose=gsub(/}/,"}");
+        if (depth==0 && nopen>0) { ours=0 }
+        if (depth==1 && line ~ /"name"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/) { ours=1 }
+        if (ours==1 && depth==1 && match(line, "^[[:space:]]*\\\"" keys_re "\\\"[[:space:]]*:")) {
+          if (line !~ /#[[:space:]]*$/) { sub(/[[:space:]]*$/, " #", line) }
+          print line
+        } else {
+          print line
+        }
+        depth += nopen - nclose; if (depth<0) depth=0
+      }
+    ' "${CLEAN_KB}.out" > "$RESTORED"
+    mv "$RESTORED" "${CLEAN_KB}.out"
+  fi
+
   mv "${CLEAN_KB}.out" "$KEYB_PATH"
   rm -f "$CLEAN_KB" "$tmp.kb"
   chown "$PUID:$PGID" "$KEYB_PATH" 2>/dev/null || true
-  log "merged keybindings.json (ours updated; per-property '#' retention honored; others preserved) → $KEYB_PATH"
+  log "merged keybindings.json (ours updated; retained props kept + '#' restored; others preserved) → $KEYB_PATH"
 }
 
 # ---------------------------

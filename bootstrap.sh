@@ -134,9 +134,11 @@ JSON
     # --- keybindings.json merge (ONLY our binding; per-property '#' retention) ---
     if [ -f "$KEYB_PATH" ]; then
       # 1) Collect retained property names from raw file (any line ending with '#')
-      RETAIN_KEYS_JSON="$(grep -E '^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$' "$KEYB_PATH" 2>/dev/null \
-        | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' \
-        | jq -R -s 'split("\n") | map(select(length>0))' )"
+      RETAIN_KEYS_JSON="$(
+        grep -E '^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$' "$KEYB_PATH" 2>/dev/null \
+          | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' \
+          | jq -R -s 'split("\n") | map(select(length>0))'
+      )"
 
       # 2) Create a cleaned temp (strip trailing '#') so jq can parse
       CLEAN_KB="$(mktemp)"
@@ -161,18 +163,10 @@ JSON
           . as $arr
           | ($kb[0]) as $desired
           | (ensureArr($arr) | map(select(type=="object" and isOurs(.; $desired))) | .[0]) as $old
-          | ($old // {}) as $o
-          | ($desired // {}) as $d
-          | ( ( ($d|keys) + ($o|keys) ) | unique ) as $allKeys
-          | ( reduce $allKeys[] as $k
-                ( {};
-                  . + { ($k):
-                        ( if ($retain | index($k)) != null
-                          then ( $o[$k] // $d[$k] )
-                          else ( $d[$k] // $o[$k] )
-                        )
-                      }
-                )
+          | ($desired
+              | reduce $retain[] as $rk
+                  (.;
+                   if (($old|type)=="object" and ($old|has($rk))) then .[$rk] = $old[$rk] else . end)
             ) as $merged
           | ( ensureArr($arr)
               | map(select(type=="object" and (isOurs(.; $desired) | not)))

@@ -124,59 +124,54 @@ install_keybinding() {
     return 0
   fi
 
-  # 1) Detect retained properties INSIDE the Bootstrap binding, even if "name" is not first.
-  #    We scan brace depth; for each object, we record:
-  #      - if it looks like the bootstrap binding (name OR (command && args) match)
-  #      - which props in that object end the line with '#'
+  # ---- Pass 1: detect retained props within the Bootstrap binding using object-buffering ----
   RETAIN_KEYS_JSON="$(
     awk '
-      function reset_obj(){ found_name=0; found_cmd=0; found_args=0; split("", keep_map); keep_list="" }
-      BEGIN{ depth=0; reset_obj() }
+      function reset_obj(){ found_name=0; found_cmd=0; found_args=0; delete(keep); keep_order_cnt=0 }
+      function push_keep(k){ if (!(k in keep)) { keep[k]=1; keep_order[++keep_order_cnt]=k } }
+      BEGIN{ depth=0; in_obj=0; reset_obj() }
       {
-        line=$0; sub(/\r$/,"",line);                           # strip CR
-        tmp=line; o=gsub(/{/,"{",tmp); tmp=line; c=gsub(/}/,"}",tmp);
-        # object start?
-        if (depth==0 && o>0) { reset_obj() }
-        in_obj = (depth==1)
+        line=$0; sub(/\r$/,"",line)          # strip CR
+        # count braces on a copy so we don'\''t mutate original line
+        tmp=line; o=gsub(/{/,"{",tmp); tmp=line; c=gsub(/}/,"}",tmp)
 
-        if (in_obj) {
+        # starting a new object?
+        if (depth==0 && o>0) { in_obj=1; reset_obj() }
+
+        if (in_obj && depth>=1) {
           if (line ~ /"name"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/) found_name=1
           if (line ~ /"command"[[:space:]]*:[[:space:]]*"workbench\.action\.tasks\.runTask"/) found_cmd=1
           if (line ~ /"args"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/) found_args=1
-
-          # property line with trailing '#'
           if (line ~ /^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$/) {
-            if (match(line,/^[[:space:]]*"([^"]+)"[[:space:]]*:/,m)) {
-              k=m[1]; if (!(k in keep_map)) { keep_map[k]=1; keep_list = keep_list ((keep_list=="")?"":RS) k }
-            }
+            if (match(line,/^[[:space:]]*"([^"]+)"[[:space:]]*:/,m)) push_keep(m[1])
           }
         }
 
         newdepth = depth + o - c
-
-        # object end?
-        if (depth==1 && newdepth==0) {
+        # end of current object?
+        if (in_obj && depth==1 && newdepth==0) {
           if (found_name || (found_cmd && found_args)) {
-            print keep_list
+            for(i=1;i<=keep_order_cnt;i++) print keep_order[i]
           }
-          reset_obj()
+          in_obj=0; reset_obj()
         }
-
         depth=newdepth; if (depth<0) depth=0
       }
     ' "$KEYB_PATH" 2>/dev/null | jq -R -s 'split("\n") | map(select(length>0)) | unique'
   )"
 
-  # 2) Clean to a temp for parsing (strip trailing # only); if parsing fails, skip to avoid clobbering.
+  # ---- Prepare a cleaned copy for jq (strip only trailing `#`) ----
   CLEAN_KB="$(mktemp)"
   sed 's/[[:space:]]*#[[:space:]]*$//' "$KEYB_PATH" > "$CLEAN_KB"
+
+  # If not valid JSON even after cleaning, skip merge to avoid clobbering
   if ! command -v jq >/dev/null 2>&1 || ! jq -e . "$CLEAN_KB" >/dev/null 2>&1; then
     log "WARNING: keybindings.json not parseable; skipping keybinding merge to avoid overwrite."
     rm -f "$CLEAN_KB"
     return 0
   fi
 
-  # 3) Merge: replace/insert our binding; copy values for retained props from old binding.
+  # ---- Pass 2: jq merge (preserve values for retained props) ----
   tmp="$(mktemp)"; printf "%s" "$KEYB_JSON" > "$tmp.kb"
   jq \
     --slurpfile kb "$tmp.kb" \
@@ -200,36 +195,42 @@ install_keybinding() {
           + [ $merged ] )
   ' "$CLEAN_KB" > "${CLEAN_KB}.out"
 
-  # 4) Restore trailing ` #` on retained properties inside the Bootstrap binding in the final file.
+  # ---- Pass 3: restore trailing ` #` on retained props, using object-buffering so order doesn’t matter ----
   RE_KEYS_RE="$(printf '%s' "${RETAIN_KEYS_JSON:-[]}" | jq -r 'map(gsub("\\\\.";"\\\\\\.")) | join("|")')"
   if [ -n "$RE_KEYS_RE" ]; then
     RESTORED="$(mktemp)"
     awk -v keys_re="$RE_KEYS_RE" '
-      function has_keyname(line) {
-        return match(line, "^[[:space:]]*\\\"" keys_re "\\\"[[:space:]]*:")
+      function reset_obj(){ bufc=0; found_name=0; found_cmd=0; found_args=0 }
+      function add_line(s){ buf[++bufc]=s }
+      function flush_obj() {
+        ours = (found_name || (found_cmd && found_args))
+        for(i=1;i<=bufc;i++){
+          line=buf[i]
+          if (ours && match(line, "^[[:space:]]*\\\"" keys_re "\\\"[[:space:]]*:") && line !~ /#[[:space:]]*$/) {
+            sub(/[[:space:]]*$/, " #", line)
+          }
+          print line
+        }
+        reset_obj()
       }
-      BEGIN{ depth=0; found_name=0; found_cmd=0; found_args=0; }
+      BEGIN{ depth=0; in_obj=0; reset_obj() }
       {
-        line=$0; sub(/\r$/,"",line);
-        tmp=line; o=gsub(/{/,"{",tmp); tmp=line; c=gsub(/}/,"}",tmp);
+        line=$0; sub(/\r$/,"",line)
+        tmp=line; o=gsub(/{/,"{",tmp); tmp=line; c=gsub(/}/,"}",tmp)
 
-        in_obj = (depth==1)
+        if (depth==0 && o>0) { in_obj=1; reset_obj() }
 
-        if (in_obj) {
+        if (in_obj && depth>=1) {
           if (line ~ /"name"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/) found_name=1
           if (line ~ /"command"[[:space:]]*:[[:space:]]*"workbench\.action\.tasks\.runTask"/) found_cmd=1
           if (line ~ /"args"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/) found_args=1
-
-          if ((found_name || (found_cmd && found_args)) && has_keyname(line)) {
-            if (line !~ /#[[:space:]]*$/) { sub(/[[:space:]]*$/, " #", line) }
-          }
+          add_line(line)
+        } else {
+          print line
         }
 
-        print line
-
         newdepth = depth + o - c
-        # leaving object: reset flags
-        if (depth==1 && newdepth==0) { found_name=found_cmd=found_args=0 }
+        if (in_obj && depth==1 && newdepth==0) { flush_obj(); in_obj=0 }
         depth=newdepth; if (depth<0) depth=0
       }
     ' "${CLEAN_KB}.out" > "$RESTORED"

@@ -18,8 +18,8 @@ SETTINGS_PATH="$USER_DIR/settings.json"
 
 REPO_SETTINGS_SRC="/config/bootstrap/bootstrap-settings.json"
 
-STATE_DIR="/config/.bootstrap" # still here if you later want deletions tracking
-MANAGED_KEYS_FILE="$STATE_DIR/managed-settings-keys.json"
+STATE_DIR="/config/.bootstrap"
+MANAGED_KEYS_FILE="$STATE_DIR/managed-settings-keys.json"  # unused now; kept for future
 
 BASE="${GIT_BASE_DIR:-/config/workspace}"
 SSH_DIR="/config/.ssh"
@@ -77,7 +77,6 @@ KEYB_JSON='{
 install_tasks() {
   ensure_dir "$USER_DIR"
 
-  # Create file if missing
   if [ ! -f "$TASKS_PATH" ]; then
     write_file "$TASKS_PATH" "$(cat <<JSON
 {
@@ -91,88 +90,81 @@ JSON
     return 0
   fi
 
-  # Must have jq to merge safely
   if ! command -v jq >/dev/null 2>&1; then
     log "jq not found; tasks.json exists → skipping merge."
     return 0
   fi
 
-  tmp="$(mktemp)"
-  printf "%s" "$TASK_JSON"   > "$tmp.task"
-  printf "%s" "$INPUTS_JSON" > "$tmp.inputs"
+  # Write desired JSONs to temp files
+  tf_dir="$(mktemp -d)"
+  printf "%s" "$TASK_JSON"   > "$tf_dir/desired_task.json"
+  printf "%s" "$INPUTS_JSON" > "$tf_dir/desired_inputs.json"
 
-  # Merge logic:
-  # - Keep other tasks unchanged
-  # - Find old task with __name == desired.__name (legacy fallback: label+command+args—optional)
-  # - Preserve keys listed in old["bootstrap-preserve"] (excluding "__name" and "bootstrap-preserve")
-  # - Keep old["bootstrap-preserve"] array itself if present
+  # Write jq filter to a temp file to avoid shell quoting issues
+  cat > "$tf_dir/filter_tasks.jq" <<'JQ'
+def ensureObj(o): if (o|type)=="object" then o else {} end;
+def ensureArr(a): if (a|type)=="array"  then a else [] end;
+
+def preserve_merge(old; desired):
+  ((old["bootstrap-preserve"] // []) | map(select(type=="string"))) as $keep
+  | (desired + {}) as $out
+  | reduce $keep[] as $k (
+      $out;
+      if ($k == "__name" or $k == "bootstrap-preserve") then .
+      elif (old | has($k)) then .[$k] = old[$k] else . end
+    )
+  | if ((old["bootstrap-preserve"] | type) == "array")
+      then .["bootstrap-preserve"] = old["bootstrap-preserve"]
+      else .
+    end;
+
+# root object
+(ensureObj(.)) as $root
+| ($root.tasks  // []) as $tasks
+| ($root.inputs // []) as $inputs
+| $root
+| .version = (.version // "2.0.0")
+| ($desired := $desiredTask)
+| ($oldStrict :=
+    (ensureArr($tasks)
+     | map(select(type=="object" and ((.__name? // "") == $desired.__name)))
+     | (if length>0 then .[0] else null end)))
+| ($oldLegacy :=
+    (ensureArr($tasks)
+     | map(select(type=="object"
+                  and ((.command? // "") == $desired.command)
+                  and ((.args? // "") == $desired.args)))
+     | (if length>0 then .[0] else null end)))
+| ($old := (if $oldStrict!=null then $oldStrict else $oldLegacy end))
+| ($merged := (if $old!=null then preserve_merge($old; $desired) else $desired end))
+| .tasks = (
+    ensureArr($tasks)
+    | map(select(type=="object"))
+    | map(select(
+        ((.__name? // "") == $desired.__name)
+        or (((.command? // "") == $desired.command) and ((.args? // "") == $desired.args))
+      ) | not))
+    + [ $merged ]
+  )
+| .inputs = (
+    ensureArr($inputs)
+    | map(select(type=="object"))
+    | ( $desiredInputs as $di
+        | reduce $di[] as $ni
+            ( .;
+              (map(.id) | index($ni.id)) as $idx
+              | if $idx == null then . + [ $ni ] else . end))
+  )
+JQ
+
   jq \
-    --slurpfile newtask "$tmp.task" \
-    --slurpfile newinputs "$tmp.inputs" '
-      def ensureObj(o): if (o|type)=="object" then o else {} end;
-      def ensureArr(a): if (a|type)=="array"  then a else [] end;
+    --argfile desiredTask "$tf_dir/desired_task.json" \
+    --argfile desiredInputs "$tf_dir/desired_inputs.json" \
+    -f "$tf_dir/filter_tasks.jq" \
+    "$TASKS_PATH" > "$tf_dir/out.json" && mv "$tf_dir/out.json" "$TASKS_PATH"
 
-      def preserve_merge($old; $desired):
-        # $keep: array of strings from bootstrap-preserve on old
-        ( ($old["bootstrap-preserve"] // []) | map(select(type=="string")) ) as $keep
-        | ($desired + {}) as $out
-        | reduce $keep[] as $k (
-            $out;
-            if ($k == "__name" or $k == "bootstrap-preserve") then .
-            else if $old | has($k) then .[$k] = $old[$k] else . end
-          )
-        # keep the old bootstrap-preserve array itself if present
-        | ( if ($old["bootstrap-preserve"]|type)=="array" then .["bootstrap-preserve"] = $old["bootstrap-preserve"] else . end );
-
-      # Root obj coercion
-      (ensureObj(.)) as $root
-      | ($root.tasks  // []) as $tasks
-      | ($root.inputs // []) as $inputs
-      | ($newtask[0]) as $desired
-
-      # Find old by __name match (strict)
-      | ( ensureArr($tasks)
-          | map(select(type=="object"))
-        ) as $T
-      | ( $T | map(select((.__name? // "") == $desired.__name)) | .[0] ) as $oldStrict
-
-      # (Optional) legacy fallback — match by command+args; only used if no __name match.
-      | ( $T
-          | map(select(((.command? // "") == $desired.command) and ((.args? // "") == $desired.args)))
-          | .[0]
-        ) as $oldLegacy
-
-      | ( if $oldStrict != null then $oldStrict else $oldLegacy end ) as $old
-
-      # Compute merged
-      | ( if $old != null then preserve_merge($old; $desired) else $desired end ) as $merged
-
-      # Replace our entry; keep others
-      | . as $root2
-      | $root2
-      | .version = ( .version // "2.0.0" )
-      | .tasks  = (
-          ensureArr($tasks)
-          | map(select(type=="object"))
-          | map(select(((.__name? // "") == $desired.__name)
-                       or (((.command? // "") == $desired.command) and ((.args? // "") == $desired.args))) | not))
-          + [ $merged ]
-        )
-
-      # Inputs: keep existing by id; add missing from desired (no preserve needed here typically)
-      | .inputs = (
-          ensureArr($inputs)
-          | map(select(type=="object"))
-          | reduce $newinputs[0][] as $ni
-              ( . ;  # for each desired input, ensure it exists once
-                (map(.id) | index($ni.id)) as $idx
-                | if $idx == null then . + [ $ni ] else . end
-              )
-        )
-    ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
-
-  rm -f "$tmp.task" "$tmp.inputs"
   chown "$PUID:$PGID" "$TASKS_PATH" 2>/dev/null || true
+  rm -rf "$tf_dir"
   log "merged tasks.json (bootstrap-preserve honored; others preserved) → $TASKS_PATH"
 }
 
@@ -182,7 +174,6 @@ JSON
 install_keybinding() {
   ensure_dir "$USER_DIR"
 
-  # If file doesn't exist, create with our binding only.
   if [ ! -f "$KEYB_PATH" ]; then
     write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
     log "created keybindings.json → $KEYB_PATH"
@@ -194,49 +185,53 @@ install_keybinding() {
     return 0
   fi
 
-  tmp="$(mktemp)"; printf "%s" "$KEYB_JSON" > "$tmp.kb"
+  tf_dir="$(mktemp -d)"
+  printf "%s" "$KEYB_JSON" > "$tf_dir/desired_kb.json"
 
-  # Merge logic for array:
-  # - Keep all other keybindings intact
-  # - Identify our binding by __name match (fallback: command+args)
-  # - Preserve keys listed in old["bootstrap-preserve"] (excluding "__name" and "bootstrap-preserve")
-  # - Keep old["bootstrap-preserve"] itself
+  cat > "$tf_dir/filter_keyb.jq" <<'JQ'
+def ensureArr(a): if (a|type)=="array" then a else [] end;
+
+def preserve_merge(old; desired):
+  ((old["bootstrap-preserve"] // []) | map(select(type=="string"))) as $keep
+  | (desired + {}) as $out
+  | reduce $keep[] as $k (
+      $out;
+      if ($k == "__name" or $k == "bootstrap-preserve") then .
+      elif (old | has($k)) then .[$k] = old[$k] else . end
+    )
+  | if ((old["bootstrap-preserve"] | type) == "array")
+      then .["bootstrap-preserve"] = old["bootstrap-preserve"]
+      else .
+    end;
+
+(ensureArr(.)) as $arr
+| ($desired := $desiredKB)
+| ($oldStrict :=
+    ($arr | map(select(type=="object" and ((.__name? // "") == $desired.__name)))
+          | (if length>0 then .[0] else null end)))
+| ($oldLegacy :=
+    ($arr | map(select(type=="object"
+                       and ((.command? // "") == $desired.command)
+                       and ((.args? // "") == $desired.args)))
+          | (if length>0 then .[0] else null end)))
+| ($old := (if $oldStrict!=null then $oldStrict else $oldLegacy end))
+| ($merged := (if $old!=null then preserve_merge($old; $desired) else $desired end))
+| ( $arr
+    | map(select(type=="object"))
+    | map(select(
+        ((.__name? // "") == $desired.__name)
+        or (((.command? // "") == $desired.command) and ((.args? // "") == $desired.args))
+      ) | not))
+    + [ $merged ]
+JQ
+
   jq \
-    --slurpfile kb "$tmp.kb" '
-      def ensureArr(a): if (a|type)=="array" then a else [] end;
+    --argfile desiredKB "$tf_dir/desired_kb.json" \
+    -f "$tf_dir/filter_keyb.jq" \
+    "$KEYB_PATH" > "$tf_dir/out.json" && mv "$tf_dir/out.json" "$KEYB_PATH"
 
-      def preserve_merge($old; $desired):
-        ( ($old["bootstrap-preserve"] // []) | map(select(type=="string")) ) as $keep
-        | ($desired + {}) as $out
-        | reduce $keep[] as $k (
-            $out;
-            if ($k == "__name" or $k == "bootstrap-preserve") then .
-            else if $old | has($k) then .[$k] = $old[$k] else . end
-          )
-        | ( if ($old["bootstrap-preserve"]|type)=="array" then .["bootstrap-preserve"] = $old["bootstrap-preserve"] else . end );
-
-      (ensureArr(.)) as $arr
-      | ($kb[0]) as $desired
-
-      # find old by __name
-      | ($arr | map(select(type=="object" and ((.__name? // "") == $desired.__name))) | .[0]) as $oldStrict
-      # legacy fallback if no __name
-      | ($arr | map(select(type=="object" and ((.command? // "") == $desired.command) and ((.args? // "") == $desired.args))) | .[0]) as $oldLegacy
-
-      | ( if $oldStrict != null then $oldStrict else $oldLegacy end ) as $old
-
-      | ( if $old != null then preserve_merge($old; $desired) else $desired end ) as $merged
-
-      | ( $arr
-          | map(select(type=="object"))
-          | map(select( ((.__name? // "") == $desired.__name)
-                        or (((.command? // "") == $desired.command) and ((.args? // "") == $desired.args)) ) | not))
-          + [ $merged ]
-        )
-    ' "$KEYB_PATH" > "$KEYB_PATH.tmp" && mv "$KEYB_PATH.tmp" "$KEYB_PATH"
-
-  rm -f "$tmp.kb"
   chown "$PUID:$PGID" "$KEYB_PATH" 2>/dev/null || true
+  rm -rf "$tf_dir"
   log "merged keybindings.json (bootstrap-preserve honored; others preserved) → $KEYB_PATH"
 }
 
@@ -259,7 +254,6 @@ install_settings_from_repo() {
   fi
 
   if [ ! -f "$SETTINGS_PATH" ]; then
-    # If user settings missing, just copy repo (no need to consider preserve)
     ensure_dir "$USER_DIR"
     cp "$REPO_SETTINGS_SRC" "$SETTINGS_PATH"
     chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
@@ -267,27 +261,30 @@ install_settings_from_repo() {
     return 0
   fi
 
-  # Merge: overlay repo onto user, but DO NOT overwrite any keys listed in user["bootstrap-preserve"].
-  # Never overwrite the "bootstrap-preserve" array itself; keep user's existing one.
-  tmp="$(mktemp)"
+  tf_dir="$(mktemp -d)"
+  cp "$REPO_SETTINGS_SRC" "$tf_dir/repo.json"
+
+  cat > "$tf_dir/filter_settings.jq" <<'JQ'
+def ensureObj(o): if (o|type)=="object" then o else {} end;
+
+(ensureObj(.)) as $user
+| (( $user["bootstrap-preserve"] // [] ) | map(select(type=="string"))) as $keep
+| (ensureObj($repo)) as $repo
+| reduce ($repo | to_entries[]) as $e (
+    ($user + {});
+    if ($e.key == "bootstrap-preserve") then .
+    elif ($keep | index($e.key)) != null then .
+    else .[$e.key] = $e.value end
+  )
+JQ
+
   jq \
-    --argjson repo "$(cat "$REPO_SETTINGS_SRC")" '
-      def ensureObj(o): if (o|type)=="object" then o else {} end;
-
-      (ensureObj(.)) as $user
-      | ( ($user["bootstrap-preserve"] // []) | map(select(type=="string")) ) as $keep
-      | (ensureObj($repo)) as $repo
-
-      # reduce over repo keys and apply into a copy of $user, skipping kept keys
-      | reduce ( $repo | to_entries[] ) as $e (
-          ($user + {}); # working copy
-          if ( ($keep | index($e.key)) != null ) then .
-          elif ($e.key == "bootstrap-preserve") then . # never overwrite preserve list
-          else .[$e.key] = $e.value end
-        )
-    ' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
+    --argfile repo "$tf_dir/repo.json" \
+    -f "$tf_dir/filter_settings.jq" \
+    "$SETTINGS_PATH" > "$tf_dir/out.json" && mv "$tf_dir/out.json" "$SETTINGS_PATH"
 
   chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
+  rm -rf "$tf_dir"
   log "merged settings.json (bootstrap-preserve honored) → $SETTINGS_PATH"
 }
 

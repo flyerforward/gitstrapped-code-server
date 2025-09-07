@@ -19,7 +19,7 @@ SETTINGS_PATH="$USER_DIR/settings.json"
 REPO_SETTINGS_SRC="/config/bootstrap/bootstrap-settings.json"
 
 STATE_DIR="/config/.bootstrap"
-MANAGED_KEYS_FILE="$STATE_DIR/managed-settings-keys.json"  # unused now; kept for future
+MANAGED_KEYS_FILE="$STATE_DIR/managed-settings-keys.json"  # reserved for future use
 
 BASE="${GIT_BASE_DIR:-/config/workspace}"
 SSH_DIR="/config/.ssh"
@@ -95,12 +95,10 @@ JSON
     return 0
   fi
 
-  # Write desired JSONs to temp files
   tf_dir="$(mktemp -d)"
   printf "%s" "$TASK_JSON"   > "$tf_dir/desired_task.json"
   printf "%s" "$INPUTS_JSON" > "$tf_dir/desired_inputs.json"
 
-  # Write jq filter to a temp file to avoid shell quoting issues
   cat > "$tf_dir/filter_tasks.jq" <<'JQ'
 def ensureObj(o): if (o|type)=="object" then o else {} end;
 def ensureArr(a): if (a|type)=="array"  then a else [] end;
@@ -118,25 +116,18 @@ def preserve_merge(old; desired):
       else .
     end;
 
-# root object
+# start from a valid root object
 (ensureObj(.)) as $root
 | ($root.tasks  // []) as $tasks
 | ($root.inputs // []) as $inputs
 | $root
 | .version = (.version // "2.0.0")
-| ($desired := $desiredTask)
-| ($oldStrict :=
-    (ensureArr($tasks)
-     | map(select(type=="object" and ((.__name? // "") == $desired.__name)))
-     | (if length>0 then .[0] else null end)))
-| ($oldLegacy :=
-    (ensureArr($tasks)
-     | map(select(type=="object"
-                  and ((.command? // "") == $desired.command)
-                  and ((.args? // "") == $desired.args)))
-     | (if length>0 then .[0] else null end)))
-| ($old := (if $oldStrict!=null then $oldStrict else $oldLegacy end))
-| ($merged := (if $old!=null then preserve_merge($old; $desired) else $desired end))
+| ($desiredTask) as $desired
+| (ensureArr($tasks) | map(select(type=="object"))) as $T
+| ($T | map(select((.__name? // "") == $desired.__name)) | if length>0 then .[0] else null end) as $oldStrict
+| ($T | map(select(((.command? // "") == $desired.command) and ((.args? // "") == $desired.args))) | if length>0 then .[0] else null end) as $oldLegacy
+| ($oldStrict // $oldLegacy) as $old
+| (if $old!=null then preserve_merge($old; $desired) else $desired end) as $merged
 | .tasks = (
     ensureArr($tasks)
     | map(select(type=="object"))
@@ -149,11 +140,11 @@ def preserve_merge(old; desired):
 | .inputs = (
     ensureArr($inputs)
     | map(select(type=="object"))
-    | ( $desiredInputs as $di
-        | reduce $di[] as $ni
-            ( .;
-              (map(.id) | index($ni.id)) as $idx
-              | if $idx == null then . + [ $ni ] else . end))
+    | ($desiredInputs as $di
+       | reduce $di[] as $ni
+           ( .;
+             (map(.id) | index($ni.id)) as $idx
+             | if $idx == null then . + [ $ni ] else . end ))
   )
 JQ
 
@@ -165,7 +156,7 @@ JQ
 
   chown "$PUID:$PGID" "$TASKS_PATH" 2>/dev/null || true
   rm -rf "$tf_dir"
-  log "merged tasks.json (bootstrap-preserve honored; others preserved) → $TASKS_PATH"
+  log "merged tasks.json (bootstrap-preserve honored; bootstrap task ensured) → $TASKS_PATH"
 }
 
 # ---------------------------
@@ -205,17 +196,13 @@ def preserve_merge(old; desired):
     end;
 
 (ensureArr(.)) as $arr
-| ($desired := $desiredKB)
-| ($oldStrict :=
-    ($arr | map(select(type=="object" and ((.__name? // "") == $desired.__name)))
-          | (if length>0 then .[0] else null end)))
-| ($oldLegacy :=
-    ($arr | map(select(type=="object"
-                       and ((.command? // "") == $desired.command)
-                       and ((.args? // "") == $desired.args)))
-          | (if length>0 then .[0] else null end)))
-| ($old := (if $oldStrict!=null then $oldStrict else $oldLegacy end))
-| ($merged := (if $old!=null then preserve_merge($old; $desired) else $desired end))
+| ($desiredKB) as $desired
+| ($arr | map(select(type=="object" and ((.__name? // "") == $desired.__name))) | if length>0 then .[0] else null end) as $oldStrict
+| ($arr | map(select(type=="object"
+                     and ((.command? // "") == $desired.command)
+                     and ((.args? // "") == $desired.args))) | if length>0 then .[0] else null end) as $oldLegacy
+| ($oldStrict // $oldLegacy) as $old
+| (if $old!=null then preserve_merge($old; $desired) else $desired end) as $merged
 | ( $arr
     | map(select(type=="object"))
     | map(select(
@@ -232,7 +219,7 @@ JQ
 
   chown "$PUID:$PGID" "$KEYB_PATH" 2>/dev/null || true
   rm -rf "$tf_dir"
-  log "merged keybindings.json (bootstrap-preserve honored; others preserved) → $KEYB_PATH"
+  log "merged keybindings.json (bootstrap-preserve honored; bootstrap keybinding ensured) → $KEYB_PATH"
 }
 
 # ---------------------------
@@ -424,7 +411,7 @@ if [ "${1:-}" = "force" ]; then
   exit 0
 fi
 
-if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ]; then
+if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ] ; then
   if [ ! -f "$LOCK_FILE" ]; then
     : > "$LOCK_FILE" || true
     log "env present and no lock → running bootstrap"

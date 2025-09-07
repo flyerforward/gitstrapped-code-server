@@ -38,6 +38,18 @@ mkdir -p "$LOCK_DIR" 2>/dev/null || true
 ensure_dir(){ mkdir -p "$1"; chown -R "$PUID:$PGID" "$1" 2>/dev/null || true; }
 write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1" 2>/dev/null || true; }
 
+# Strip JSONC-ish stuff -> JSON (best-effort, safe for jq)
+jsonc_to_json() {
+  # in -> out
+  in="$1"; out="$2"
+  # Remove /* block comments */
+  sed -E ':a; s@/\*([^*]|\*+[^*/])*\*/@@g; ta' "$in" \
+  | sed -E 's@^[[:space:]]*//.*$@@' \            # Remove // full-line comments
+  | sed -E 's/[[:space:]]*#[[:space:]]*$//' \     # Strip trailing # comments
+  | sed -E ':b; s/,\s*([}\]])/\1/g; tb' \         # Remove trailing commas
+  | sed -E '/^[[:space:]]*$/d' > "$out"
+}
+
 # ---------------------------
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
@@ -133,48 +145,69 @@ JSON
 
     # --- keybindings.json merge (ONLY our binding; per-property '#' retention) ---
     if [ -f "$KEYB_PATH" ]; then
-      # 1) Collect retained property names from raw file (any line ending with '#')
-      RETAIN_KEYS_JSON="$(
-        grep -E '^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$' "$KEYB_PATH" 2>/dev/null \
-          | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' \
-          | jq -R -s 'split("\n") | map(select(length>0))'
-      )"
-
-      # 2) Create a cleaned temp (strip trailing '#') so jq can parse
-      CLEAN_KB="$(mktemp)"
-      sed 's/[[:space:]]*#[[:space:]]*$//' "$KEYB_PATH" > "$CLEAN_KB"
-      if ! jq -e . "$CLEAN_KB" >/dev/null 2>&1; then
-        cp "$KEYB_PATH" "$KEYB_PATH.bak"
-        printf '[]' > "$CLEAN_KB"
+      # 1) Collect retained property names FROM OUR BINDING ONLY
+      RETAIN_KEYS_JSON="[]"
+      if [ -s "$KEYB_PATH" ]; then
+        RETAIN_KEYS_JSON="$(
+          awk '
+            BEGIN{depth=0; ours=0; saw_cmd=0}
+            {
+              # crude brace counting suitable for keybindings structures
+              # count { and }
+              nopen=gsub(/{/,"{"); nclose=gsub(/}/,"}");
+              if (depth==0 && nopen>0) { ours=0; saw_cmd=0 }
+              # detect our binding by name or legacy command+args
+              if (depth==1 && match($0,/"name"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/)) { ours=1 }
+              if (depth==1 && match($0,/"command"[[:space:]]*:[[:space:]]*"workbench\.action\.tasks\.runTask"/)) { saw_cmd=1 }
+              if (depth==1 && saw_cmd && match($0,/"args"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/)) { ours=1 }
+              # if ours, capture prop names whose line ends with #
+              if (depth==1 && ours==1) {
+                if ($0 ~ /^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$/) {
+                  if (match($0,/^[[:space:]]*"([^"]+)"[[:space:]]*:/,m)) print m[1];
+                }
+              }
+              depth += nopen - nclose
+              if (depth<0) depth=0
+            }
+          ' "$KEYB_PATH" | jq -R -s 'split("\n") | map(select(length>0))'
+        )"
       fi
 
-      # 3) Merge: keep all user bindings; for our binding, update only non-retained props
-      tmp="$(mktemp)"
-      printf "%s" "$KEYB_JSON" > "$tmp.kb"
-      jq \
-        --slurpfile kb "$tmp.kb" \
-        --argjson retain "${RETAIN_KEYS_JSON:-[]}" '
-          def ensureArr(a): if (a|type)=="array" then a else [] end;
-          def isOurs($o; $d):
-            ((($o.name? // "") == $d.name)
-             or ((($o.command? // "") == $d.command)
-                 and (($o.args? // "") == $d.args)));
+      # 2) Clean JSONC to JSON so jq can parse safely; if parsing still fails, skip merge to avoid clobbering
+      CLEAN_KB="$(mktemp)"
+      jsonc_to_json "$KEYB_PATH" "$CLEAN_KB"
+      if ! jq -e . "$CLEAN_KB" >/dev/null 2>&1; then
+        log "WARNING: keybindings.json could not be parsed after cleaning; skipping keybinding merge to avoid overwriting."
+      else
+        # 3) Merge: keep all user bindings; for our binding, update only non-retained props
+        tmp="$(mktemp)"
+        printf "%s" "$KEYB_JSON" > "$tmp.kb"
+        jq \
+          --slurpfile kb "$tmp.kb" \
+          --argjson retain "${RETAIN_KEYS_JSON:-[]}" '
+            def ensureArr(a): if (a|type)=="array" then a else [] end;
+            def isOurs($o; $d):
+              ((($o.name? // "") == $d.name)
+               or ((($o.command? // "") == $d.command)
+                   and (($o.args? // "") == $d.args)));
 
-          . as $arr
-          | ($kb[0]) as $desired
-          | (ensureArr($arr) | map(select(type=="object" and isOurs(.; $desired))) | .[0]) as $old
-          | ($desired
-              | reduce $retain[] as $rk
-                  (.;
-                   if (($old|type)=="object" and ($old|has($rk))) then .[$rk] = $old[$rk] else . end)
-            ) as $merged
-          | ( ensureArr($arr)
-              | map(select(type=="object" and (isOurs(.; $desired) | not)))
-              + [ $merged ] )
-      ' "$CLEAN_KB" > "$KEYB_PATH"
-      rm -f "$CLEAN_KB" "$tmp.kb"
-      chown "$PUID:$PGID" "$KEYB_PATH" 2>/dev/null || true
-      log "merged keybindings.json (ours updated; per-property '#' retention honored; others preserved) → $KEYB_PATH"
+            . as $arr
+            | ($kb[0]) as $desired
+            | (ensureArr($arr) | map(select(type=="object" and isOurs(.; $desired))) | .[0]) as $old
+            | ($desired
+                | reduce $retain[] as $rk
+                    (.;
+                     if (($old|type)=="object" and ($old|has($rk))) then .[$rk] = $old[$rk] else . end)
+              ) as $merged
+            | ( ensureArr($arr)
+                | map(select(type=="object" and (isOurs(.; $desired) | not)))
+                + [ $merged ] )
+        ' "$CLEAN_KB" > "$KEYB_PATH"
+        rm -f "$tmp.kb"
+        chown "$PUID:$PGID" "$KEYB_PATH" 2>/dev/null || true
+        log "merged keybindings.json (ours updated; per-property '#' retention honored; others preserved) → $KEYB_PATH"
+      fi
+      rm -f "$CLEAN_KB"
     else
       write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
       log "created keybindings.json → $KEYB_PATH"

@@ -14,6 +14,13 @@ PGID="${PGID:-1000}"
 USER_DIR="/config/data/User"
 TASKS_PATH="$USER_DIR/tasks.json"
 KEYB_PATH="$USER_DIR/keybindings.json"
+SETTINGS_PATH="$USER_DIR/settings.json"
+
+# Only this repo settings source
+REPO_SETTINGS_SRC="/custom-cont-init.d/bootstrap-settings.json"
+
+STATE_DIR="/config/.bootstrap"
+MANAGED_KEYS_FILE="$STATE_DIR/managed-settings-keys.json"
 
 BASE="${GIT_BASE_DIR:-/config/workspace}"
 SSH_DIR="/config/.ssh"
@@ -35,12 +42,12 @@ write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
 TASK_LABEL="Bootstrap GitHub Workspace"
-# NOTE: pass "force" so manual runs ignore the autorun lock
+# NOTE: Task passes "force" to bypass autorun lock
 TASK_JSON='{
   "label": "Bootstrap GitHub Workspace",
   "type": "shell",
   "command": "sh",
-  "args": ["/custom-cont-init.d/10-bootstrap.sh", "force"],
+  "args": ["/custom-cont-init.d/10-github-bootstrap.sh", "force"],
   "options": {
     "env": {
       "GH_USER": "${input:gh_user}",
@@ -67,13 +74,13 @@ KEYB_JSON='{
 }'
 
 # ---------------------------
-# INSTALL/MERGE USER ASSETS
+# INSTALL/MERGE USER ASSETS (tasks + keybinding)
 # ---------------------------
 install_user_assets() {
   ensure_dir "$USER_DIR"
 
   # Normalize malformed keybindings.json (array required)
-  if [ -f "$KEYB_PATH" ] && command -v jq >/devnull 2>&1; then
+  if [ -f "$KEYB_PATH" ] && command -v jq >/dev/null 2>&1; then
     tmp="$(mktemp)"
     if ! jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
       cp "$KEYB_PATH" "$KEYB_PATH.bak"
@@ -169,6 +176,75 @@ JSON
       log "jq not found; keybindings.json exists → skipping merge."
     fi
   fi
+}
+
+# ---------------------------
+# SETTINGS MERGE (repo settings → user settings)
+# ---------------------------
+install_settings_from_repo() {
+  # Only proceed if the single expected settings file exists
+  [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo bootstrap-settings.json; skipping settings merge"; return 0; }
+
+  if ! command -v jq >/dev/null 2>&1; then
+    # Without jq, be conservative: only create if missing
+    if [ ! -f "$SETTINGS_PATH" ]; then
+      ensure_dir "$USER_DIR"
+      cp "$REPO_SETTINGS_SRC" "$SETTINGS_PATH"
+      chown "$PUID:$PGID" "$SETTINGS_PATH"
+      log "created settings.json from repo (no jq) → $SETTINGS_PATH"
+    else
+      log "jq not found; settings.json exists → skipping merge."
+    fi
+    return 0
+  fi
+
+  # Validate repo settings JSON
+  if ! jq -e . "$REPO_SETTINGS_SRC" >/dev/null 2>&1; then
+    log "WARNING: repo settings JSON invalid → $REPO_SETTINGS_SRC ; skipping settings merge"
+    return 0
+  fi
+
+  ensure_dir "$STATE_DIR"
+  ensure_dir "$USER_DIR"
+
+  # Ensure user settings is an object
+  if [ -f "$SETTINGS_PATH" ]; then
+    if ! jq -e . "$SETTINGS_PATH" >/dev/null 2>&1; then
+      cp "$SETTINGS_PATH" "$SETTINGS_PATH.bak"
+      printf "{}" > "$SETTINGS_PATH"
+    else
+      tmp="$(mktemp)"; jq 'if type=="object" then . else {} end' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
+    fi
+  else
+    printf "{}" > "$SETTINGS_PATH"
+    chown "$PUID:$PGID" "$SETTINGS_PATH"
+  fi
+
+  # keys arrays
+  RS_KEYS_JSON="$(jq 'keys' "$REPO_SETTINGS_SRC")"
+  if [ -f "$MANAGED_KEYS_FILE" ] && jq -e . "$MANAGED_KEYS_FILE" >/dev/null 2>&1; then
+    OLD_KEYS_JSON="$(cat "$MANAGED_KEYS_FILE")"
+  else
+    OLD_KEYS_JSON='[]'
+  fi
+
+  tmp="$(mktemp)"
+  jq \
+    --argjson repo "$(cat "$REPO_SETTINGS_SRC")" \
+    --argjson rskeys "$RS_KEYS_JSON" \
+    --argjson oldkeys "$OLD_KEYS_JSON" '
+      def contains($arr; $x): any($arr[]; . == $x);
+      def minus($a; $b): [ $a[] | select(contains($b; .) | not) ];
+      def delKeys($ks): reduce $ks[] as $k (. ; del(.[$k]));
+      (. // {}) as $user
+      | delKeys(minus($oldkeys; $rskeys))   # remove previously managed keys no longer present
+      | . + $repo                           # overlay repo keys (ours take precedence)
+    ' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
+  chown "$PUID:$PGID" "$SETTINGS_PATH"
+  printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"
+  chown "$PUID:$PGID" "$MANAGED_KEYS_FILE"
+
+  log "merged settings.json (repo overrides; deletions honored) → $SETTINGS_PATH"
 }
 
 # ---------------------------
@@ -298,6 +374,7 @@ do_bootstrap(){
 # RUN
 # ---------------------------
 install_user_assets
+install_settings_from_repo
 
 # If invoked with "force", always run bootstrap (bypass lock)
 if [ "${1:-}" = "force" ]; then
@@ -319,4 +396,4 @@ else
   log "GH_USER/GH_PAT missing → skip autorun (use Ctrl+Alt+G or Tasks: Run Task)"
 fi
 
-log "Task + keybinding installed under: $USER_DIR (reload window if not visible)"
+log "Task + keybinding + (optional) settings installed under: $USER_DIR (reload window if not visible)"

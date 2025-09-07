@@ -35,11 +35,12 @@ write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
 TASK_LABEL="Bootstrap GitHub Workspace"
+# NOTE: pass "force" so manual runs ignore the autorun lock
 TASK_JSON='{
   "label": "Bootstrap GitHub Workspace",
   "type": "shell",
   "command": "sh",
-  "args": ["/custom-cont-init.d/10-bootstrap.sh"],
+  "args": ["/custom-cont-init.d/10-bootstrap.sh", "force"],
   "options": {
     "env": {
       "GH_USER": "${input:gh_user}",
@@ -72,7 +73,7 @@ install_user_assets() {
   ensure_dir "$USER_DIR"
 
   # Normalize malformed keybindings.json (array required)
-  if [ -f "$KEYB_PATH" ] && command -v jq >/dev/null 2>&1; then
+  if [ -f "$KEYB_PATH" ] && command -v jq >/devnull 2>&1; then
     tmp="$(mktemp)"
     if ! jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
       cp "$KEYB_PATH" "$KEYB_PATH.bak"
@@ -298,6 +299,14 @@ do_bootstrap(){
 # ---------------------------
 install_user_assets
 
+# If invoked with "force", always run bootstrap (bypass lock)
+if [ "${1:-}" = "force" ]; then
+  log "manual run (force) → ignoring autorun lock"
+  do_bootstrap
+  exit 0
+fi
+
+# Otherwise, normal autorun behavior on container start
 if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ]; then
   if [ ! -f "$LOCK_FILE" ]; then
     : > "$LOCK_FILE" || true

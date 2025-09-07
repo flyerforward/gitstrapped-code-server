@@ -17,7 +17,7 @@ KEYB_PATH="$USER_DIR/keybindings.json"
 SETTINGS_PATH="$USER_DIR/settings.json"
 
 # Only this repo settings source
-REPO_SETTINGS_SRC="/custom-cont-init.d/bootstrap-settings.json"
+REPO_SETTINGS_SRC="/config/bootstrap/bootstrap-settings.json"
 
 STATE_DIR="/config/.bootstrap"
 MANAGED_KEYS_FILE="$STATE_DIR/managed-settings-keys.json"  # tracks keys we manage for deletion logic

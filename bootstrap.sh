@@ -18,7 +18,7 @@ SETTINGS_PATH="$USER_DIR/settings.json"
 
 REPO_SETTINGS_SRC="/config/bootstrap/bootstrap-settings.json"
 
-STATE_DIR="/config/.bootstrap"
+STATE_DIR="/config/.bootstrap" # still here if you later want deletions tracking
 MANAGED_KEYS_FILE="$STATE_DIR/managed-settings-keys.json"
 
 BASE="${GIT_BASE_DIR:-/config/workspace}"
@@ -38,9 +38,10 @@ ensure_dir(){ mkdir -p "$1"; chown -R "$PUID:$PGID" "$1" 2>/dev/null || true; }
 write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1" 2>/dev/null || true; }
 
 # ---------------------------
-# DESIRED TASK + KEYBINDING
+# DESIRED TASK + KEYBINDING (with __name)
 # ---------------------------
 TASK_JSON='{
+  "__name": "Bootstrap GitHub Workspace",
   "label": "Bootstrap GitHub Workspace",
   "type": "shell",
   "command": "sh",
@@ -64,42 +65,20 @@ INPUTS_JSON='[
   { "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
 ]'
 KEYB_JSON='{
-  "name": "Bootstrap GitHub Workspace",
+  "__name": "Bootstrap GitHub Workspace",
   "key": "ctrl+alt+g",
   "command": "workbench.action.tasks.runTask",
   "args": "Bootstrap GitHub Workspace"
 }'
 
 # ---------------------------
-# INSTALL TASKS (safe merge)
+# INSTALL TASKS (safe merge + bootstrap-preserve)
 # ---------------------------
 install_tasks() {
   ensure_dir "$USER_DIR"
-  if command -v jq >/dev/null 2>&1 && [ -f "$TASKS_PATH" ] && jq -e . "$TASKS_PATH" >/dev/null 2>&1; then
-    tmp="$(mktemp)"; printf "%s" "$TASK_JSON" > "$tmp.task"
-    printf "%s" "$INPUTS_JSON" > "$tmp.inputs"
-    jq \
-      --slurpfile newtask "$tmp.task" \
-      --slurpfile newinputs "$tmp.inputs" '
-        def ensureObj(o): if (o|type)=="object" then o else {} end;
-        def ensureArr(a): if (a|type)=="array"  then a else [] end;
-        (ensureObj(.)) as $root
-        | ($root.tasks  // []) as $tasks
-        | ($root.inputs // []) as $inputs
-        | $root
-        | .version = ( .version // "2.0.0" )
-        | .tasks  = ( ensureArr($tasks)
-                      | map(select(type=="object" and (.label? // null) != $newtask[0].label))
-                      + [ $newtask[0] ] )
-        | .inputs = ( ensureArr($inputs)
-                      | reduce $newinputs[0][] as $ni
-                          ( . ;
-                            map(select(type=="object" and (.id? // null) != $ni.id)) + [ $ni ] ) )
-      ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
-    rm -f "$tmp.task" "$tmp.inputs"
-    chown "$PUID:$PGID" "$TASKS_PATH" 2>/dev/null || true
-    log "merged tasks.json (ours overwritten by label/id) → $TASKS_PATH"
-  else
+
+  # Create file if missing
+  if [ ! -f "$TASKS_PATH" ]; then
     write_file "$TASKS_PATH" "$(cat <<JSON
 {
   "version": "2.0.0",
@@ -109,11 +88,96 @@ install_tasks() {
 JSON
 )"
     log "created tasks.json → $TASKS_PATH"
+    return 0
   fi
+
+  # Must have jq to merge safely
+  if ! command -v jq >/dev/null 2>&1; then
+    log "jq not found; tasks.json exists → skipping merge."
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+  printf "%s" "$TASK_JSON"   > "$tmp.task"
+  printf "%s" "$INPUTS_JSON" > "$tmp.inputs"
+
+  # Merge logic:
+  # - Keep other tasks unchanged
+  # - Find old task with __name == desired.__name (legacy fallback: label+command+args—optional)
+  # - Preserve keys listed in old["bootstrap-preserve"] (excluding "__name" and "bootstrap-preserve")
+  # - Keep old["bootstrap-preserve"] array itself if present
+  jq \
+    --slurpfile newtask "$tmp.task" \
+    --slurpfile newinputs "$tmp.inputs" '
+      def ensureObj(o): if (o|type)=="object" then o else {} end;
+      def ensureArr(a): if (a|type)=="array"  then a else [] end;
+
+      def preserve_merge($old; $desired):
+        # $keep: array of strings from bootstrap-preserve on old
+        ( ($old["bootstrap-preserve"] // []) | map(select(type=="string")) ) as $keep
+        | ($desired + {}) as $out
+        | reduce $keep[] as $k (
+            $out;
+            if ($k == "__name" or $k == "bootstrap-preserve") then .
+            else if $old | has($k) then .[$k] = $old[$k] else . end
+          )
+        # keep the old bootstrap-preserve array itself if present
+        | ( if ($old["bootstrap-preserve"]|type)=="array" then .["bootstrap-preserve"] = $old["bootstrap-preserve"] else . end );
+
+      # Root obj coercion
+      (ensureObj(.)) as $root
+      | ($root.tasks  // []) as $tasks
+      | ($root.inputs // []) as $inputs
+      | ($newtask[0]) as $desired
+
+      # Find old by __name match (strict)
+      | ( ensureArr($tasks)
+          | map(select(type=="object"))
+        ) as $T
+      | ( $T | map(select((.__name? // "") == $desired.__name)) | .[0] ) as $oldStrict
+
+      # (Optional) legacy fallback — match by command+args; only used if no __name match.
+      | ( $T
+          | map(select(((.command? // "") == $desired.command) and ((.args? // "") == $desired.args)))
+          | .[0]
+        ) as $oldLegacy
+
+      | ( if $oldStrict != null then $oldStrict else $oldLegacy end ) as $old
+
+      # Compute merged
+      | ( if $old != null then preserve_merge($old; $desired) else $desired end ) as $merged
+
+      # Replace our entry; keep others
+      | . as $root2
+      | $root2
+      | .version = ( .version // "2.0.0" )
+      | .tasks  = (
+          ensureArr($tasks)
+          | map(select(type=="object"))
+          | map(select(((.__name? // "") == $desired.__name)
+                       or (((.command? // "") == $desired.command) and ((.args? // "") == $desired.args))) | not))
+          + [ $merged ]
+        )
+
+      # Inputs: keep existing by id; add missing from desired (no preserve needed here typically)
+      | .inputs = (
+          ensureArr($inputs)
+          | map(select(type=="object"))
+          | reduce $newinputs[0][] as $ni
+              ( . ;  # for each desired input, ensure it exists once
+                (map(.id) | index($ni.id)) as $idx
+                | if $idx == null then . + [ $ni ] else . end
+              )
+        )
+    ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
+
+  rm -f "$tmp.task" "$tmp.inputs"
+  chown "$PUID:$PGID" "$TASKS_PATH" 2>/dev/null || true
+  log "merged tasks.json (bootstrap-preserve honored; others preserved) → $TASKS_PATH"
 }
 
 # ---------------------------
-# INSTALL KEYBINDING (safe merge + # retention + re-add)
+# INSTALL KEYBINDING (safe merge + bootstrap-preserve)
 # ---------------------------
 install_keybinding() {
   ensure_dir "$USER_DIR"
@@ -125,102 +189,59 @@ install_keybinding() {
     return 0
   fi
 
-  # Collect per-property retention markers (any prop line ending with #)
-  RETAIN_KEYS_JSON="$(
-    grep -E '^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$' "$KEYB_PATH" 2>/dev/null \
-      | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' \
-      | jq -R -s 'split("\n") | map(select(length>0)) | unique'
-  )"
-
-  # Clean copy: strip trailing '#' so jq can parse
-  CLEAN_KB="$(mktemp)"
-  sed 's/[[:space:]]*#[[:space:]]*$//' "$KEYB_PATH" > "$CLEAN_KB"
-
-  # If not valid JSON, skip merge (do NOT overwrite the file).
-  if ! command -v jq >/dev/null 2>&1 || ! jq -e . "$CLEAN_KB" >/dev/null 2>&1; then
-    log "WARNING: keybindings.json not parseable; skipping keybinding merge to avoid overwrite."
-    rm -f "$CLEAN_KB"
+  if ! command -v jq >/dev/null 2>&1; then
+    log "jq not found; keybindings.json exists → skipping merge."
     return 0
   fi
 
   tmp="$(mktemp)"; printf "%s" "$KEYB_JSON" > "$tmp.kb"
 
-  # Merge: keep everything, replace only our binding (by name OR legacy command+args),
-  # and copy over any keys that were pinned last run.
+  # Merge logic for array:
+  # - Keep all other keybindings intact
+  # - Identify our binding by __name match (fallback: command+args)
+  # - Preserve keys listed in old["bootstrap-preserve"] (excluding "__name" and "bootstrap-preserve")
+  # - Keep old["bootstrap-preserve"] itself
   jq \
-    --slurpfile kb "$tmp.kb" \
-    --argjson retain "${RETAIN_KEYS_JSON:-[]}" '
+    --slurpfile kb "$tmp.kb" '
       def ensureArr(a): if (a|type)=="array" then a else [] end;
-      def isOurs($o; $d):
-        ((($o.name? // "") == $d.name)
-         or ((($o.command? // "") == $d.command)
-             and (($o.args? // "") == $d.args)));
 
-      . as $arr
+      def preserve_merge($old; $desired):
+        ( ($old["bootstrap-preserve"] // []) | map(select(type=="string")) ) as $keep
+        | ($desired + {}) as $out
+        | reduce $keep[] as $k (
+            $out;
+            if ($k == "__name" or $k == "bootstrap-preserve") then .
+            else if $old | has($k) then .[$k] = $old[$k] else . end
+          )
+        | ( if ($old["bootstrap-preserve"]|type)=="array" then .["bootstrap-preserve"] = $old["bootstrap-preserve"] else . end );
+
+      (ensureArr(.)) as $arr
       | ($kb[0]) as $desired
-      | (ensureArr($arr) | map(select(type=="object" and isOurs(.; $desired))) | .[0]) as $old
-      | ($desired
-          | reduce $retain[] as $rk
-              (.;
-               if (($old|type)=="object" and ($old|has($rk))) then .[$rk] = $old[$rk] else . end)
-        ) as $merged
-      | ( ensureArr($arr)
-          | map(select(type=="object" and (isOurs(.; $desired) | not)))
-          + [ $merged ] )
-  ' "$CLEAN_KB" > "${CLEAN_KB}.out"
 
-  # Write merged JSON
-  mv "${CLEAN_KB}.out" "$KEYB_PATH"
-  rm -f "$CLEAN_KB" "$tmp.kb"
-  chown "$PUID:$PGID" "$KEYB_PATH" 2>/dev/null || true
-  log "merged keybindings.json (ours updated; per-property '#' retention honored; others preserved) → $KEYB_PATH"
+      # find old by __name
+      | ($arr | map(select(type=="object" and ((.__name? // "") == $desired.__name))) | .[0]) as $oldStrict
+      # legacy fallback if no __name
+      | ($arr | map(select(type=="object" and ((.command? // "") == $desired.command) and ((.args? // "") == $desired.args))) | .[0]) as $oldLegacy
 
-  # Re-add trailing " #"(hash) markers ONLY inside our binding object, for previously pinned keys.
-  RETAIN_LIST="$(printf "%s" "${RETAIN_KEYS_JSON:-[]}" | jq -r '.[]' 2>/dev/null | xargs 2>/dev/null || true)"
-  if [ -n "$RETAIN_LIST" ]; then
-    awk -v want_name='Bootstrap GitHub Workspace' -v keep_list="$RETAIN_LIST" '
-      BEGIN {
-        inobj=0; depth=0; seen_name=0;
-        n = split(keep_list, a, /[[:space:]]+/);
-        for (i=1;i<=n;i++) if (length(a[i])>0) keep[a[i]]=1;
-      }
-      {
-        line=$0;
+      | ( if $oldStrict != null then $oldStrict else $oldLegacy end ) as $old
 
-        # Detect object via name field
-        if (line ~ /"name"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/) seen_name=1;
+      | ( if $old != null then preserve_merge($old; $desired) else $desired end ) as $merged
 
-        # Approximate brace tracking (good for jq pretty output)
-        opens = gsub(/{/,"{",line_tmp=$0);
-        closes = gsub(/}/,"}",line_tmp=$0);
-
-        if (!inobj && seen_name && opens>0) { inobj=1; depth=0; }
-
-        if (inobj) {
-          depth += opens - closes;
-
-          # If property line inside our object, maybe append " #"
-          if (match($0, /^[[:space:]]*"([^"]+)"[[:space:]]*:/, m)) {
-            prop=m[1];
-            if (keep[prop] && $0 !~ /#[[:space:]]*$/) {
-              sub(/[[:space:]]*$/, " #", $0);
-            }
-          }
-
-          # When depth returns to 0 or less, we’ve left the object.
-          if (depth<=0) { inobj=0; seen_name=0; }
-        }
-
-        print $0;
-      }
+      | ( $arr
+          | map(select(type=="object"))
+          | map(select( ((.__name? // "") == $desired.__name)
+                        or (((.command? // "") == $desired.command) and ((.args? // "") == $desired.args)) ) | not))
+          + [ $merged ]
+        )
     ' "$KEYB_PATH" > "$KEYB_PATH.tmp" && mv "$KEYB_PATH.tmp" "$KEYB_PATH"
-    chown "$PUID:$PGID" "$KEYB_PATH" 2>/dev/null || true
-    log "re-added '#' markers for pinned keys inside our binding → $KEYB_PATH"
-  fi
+
+  rm -f "$tmp.kb"
+  chown "$PUID:$PGID" "$KEYB_PATH" 2>/dev/null || true
+  log "merged keybindings.json (bootstrap-preserve honored; others preserved) → $KEYB_PATH"
 }
 
 # ---------------------------
-# SETTINGS MERGE (repo → user)
+# SETTINGS MERGE (repo → user) with bootstrap-preserve
 # ---------------------------
 install_settings_from_repo() {
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo bootstrap-settings.json; skipping settings merge"; return 0; }
@@ -237,50 +258,37 @@ install_settings_from_repo() {
     return 0
   fi
 
-  if ! jq -e . "$REPO_SETTINGS_SRC" >/dev/null 2>&1; then
-    log "WARNING: repo settings JSON invalid → $REPO_SETTINGS_SRC ; skipping settings merge"
+  if [ ! -f "$SETTINGS_PATH" ]; then
+    # If user settings missing, just copy repo (no need to consider preserve)
+    ensure_dir "$USER_DIR"
+    cp "$REPO_SETTINGS_SRC" "$SETTINGS_PATH"
+    chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
+    log "created settings.json from repo → $SETTINGS_PATH"
     return 0
   fi
 
-  ensure_dir "$STATE_DIR"
-  ensure_dir "$USER_DIR"
-
-  if [ -f "$SETTINGS_PATH" ]; then
-    if ! jq -e . "$SETTINGS_PATH" >/dev/null 2>&1; then
-      cp "$SETTINGS_PATH" "$SETTINGS_PATH.bak"
-      printf "{}" > "$SETTINGS_PATH"
-    else
-      tmp="$(mktemp)"; jq 'if type=="object" then . else {} end' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
-    fi
-  else
-    printf "{}" > "$SETTINGS_PATH"
-    chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
-  fi
-
-  RS_KEYS_JSON="$(jq 'keys' "$REPO_SETTINGS_SRC")"
-  if [ -f "$MANAGED_KEYS_FILE" ] && jq -e . "$MANAGED_KEYS_FILE" >/dev/null 2>&1; then
-    OLD_KEYS_JSON="$(cat "$MANAGED_KEYS_FILE")"
-  else
-    OLD_KEYS_JSON='[]'
-  fi
-
+  # Merge: overlay repo onto user, but DO NOT overwrite any keys listed in user["bootstrap-preserve"].
+  # Never overwrite the "bootstrap-preserve" array itself; keep user's existing one.
   tmp="$(mktemp)"
   jq \
-    --argjson repo "$(cat "$REPO_SETTINGS_SRC")" \
-    --argjson rskeys "$RS_KEYS_JSON" \
-    --argjson oldkeys "$OLD_KEYS_JSON" '
-      def contains($arr; $x): any($arr[]; . == $x);
-      def minus($a; $b): [ $a[] | select(contains($b; .) | not) ];
-      def delKeys($ks): reduce $ks[] as $k (. ; del(.[$k]));
-      (. // {}) as $user
-      | delKeys(minus($oldkeys; $rskeys))   # remove previously managed keys no longer present
-      | . + $repo                           # overlay repo keys (ours take precedence)
-    ' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
-  chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
-  printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"
-  chown "$PUID:$PGID" "$MANAGED_KEYS_FILE" 2>/dev/null || true
+    --argjson repo "$(cat "$REPO_SETTINGS_SRC")" '
+      def ensureObj(o): if (o|type)=="object" then o else {} end;
 
-  log "merged settings.json (repo overrides; deletions honored) → $SETTINGS_PATH"
+      (ensureObj(.)) as $user
+      | ( ($user["bootstrap-preserve"] // []) | map(select(type=="string")) ) as $keep
+      | (ensureObj($repo)) as $repo
+
+      # reduce over repo keys and apply into a copy of $user, skipping kept keys
+      | reduce ( $repo | to_entries[] ) as $e (
+          ($user + {}); # working copy
+          if ( ($keep | index($e.key)) != null ) then .
+          elif ($e.key == "bootstrap-preserve") then . # never overwrite preserve list
+          else .[$e.key] = $e.value end
+        )
+    ' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
+
+  chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
+  log "merged settings.json (bootstrap-preserve honored) → $SETTINGS_PATH"
 }
 
 # ---------------------------

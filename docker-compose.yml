@@ -13,7 +13,7 @@ services:
       GIT_REPOS: "${GIT_REPOS}"
       GIT_BASE_DIR: "/config/workspace"
     volumes:
-      - code-config:/config
+      - code-config:/config1
       - code-config:/config
       - projects:/config/workspace
       - ./bootstrap-settings.json:/config/bootstrap/bootstrap-settings.json:ro

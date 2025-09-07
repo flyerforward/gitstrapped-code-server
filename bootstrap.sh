@@ -66,7 +66,7 @@ INPUTS_JSON='[
   { "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}" },
   { "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
 ]'
-# GLOBAL shortcut (no "when") — now with a "name" to target safely
+# GLOBAL shortcut (no "when") — includes "name" for safe targeting
 KEYB_JSON='{
   "name": "Bootstrap GitHub Workspace",
   "key": "ctrl+alt+g",
@@ -80,7 +80,7 @@ KEYB_JSON='{
 install_user_assets() {
   ensure_dir "$USER_DIR"
 
-  # Normalize malformed keybindings.json (array required)
+  # Normalize malformed keybindings.json (must be array)
   if [ -f "$KEYB_PATH" ] && command -v jq >/dev/null 2>&1; then
     tmp="$(mktemp)"
     if ! jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
@@ -131,29 +131,59 @@ JSON
       log "created tasks.json → $TASKS_PATH"
     fi
 
-    # --- keybindings.json merge (replace ONLY our binding by name; keep user bindings) ---
-    if [ -f "$KEYB_PATH" ] && jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
+    # --- keybindings.json merge (ONLY our binding; with per-property retention via '#') ---
+    if [ -f "$KEYB_PATH" ]; then
+      # 1) Collect retained property names from raw file (any line ending with '#')
+      #    Example match:   "key": "ctrl+alt+b", #   -> retain prop "key"
+      RETAIN_KEYS_JSON="$(grep -E '^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$' "$KEYB_PATH" 2>/dev/null \
+        | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' \
+        | jq -R -s 'split("\n") | map(select(length>0))' )"
+
+      # 2) Create a cleaned temp (strip trailing '#') so jq can parse
+      CLEAN_KB="$(mktemp)"
+      sed 's/[[:space:]]*#[[:space:]]*$//' "$KEYB_PATH" > "$CLEAN_KB"
+      if ! jq -e . "$CLEAN_KB" >/dev/null 2>&1; then
+        cp "$KEYB_PATH" "$KEYB_PATH.bak"
+        printf '[]' > "$CLEAN_KB"
+      fi
+
+      # 3) Merge: keep all user bindings; for our binding, update only non-retained props
       tmp="$(mktemp)"
       printf "%s" "$KEYB_JSON" > "$tmp.kb"
-      jq --slurpfile kb "$tmp.kb" '
-        def ensureArr(a): if (a|type)=="array" then a else [] end;
-        (ensureArr(.)) as $arr
-        | (
-            $arr
-            | map(select(type=="object"))
-            # Keep everything EXCEPT any entry that is our bootstrap binding:
-            #  - Preferred match: .name equals ours
-            #  - Legacy cleanup: command+args equals ours (older versions without "name")
-            | map(select( (
-                            ((.name? // "") == $kb[0].name)
-                            or ( ((.command? // "") == $kb[0].command) and ((.args? // "") == $kb[0].args) )
-                          ) | not ))
-          )
-          + [ $kb[0] ]
-      ' "$KEYB_PATH" > "$tmp.out" && mv "$tmp.out" "$KEYB_PATH"
-      rm -f "$tmp.kb"
+      jq \
+        --slurpfile kb "$tmp.kb" \
+        --argjson retain "${RETAIN_KEYS_JSON:-[]}" '
+          def ensureArr(a): if (a|type)=="array" then a else [] end;
+          . as $arr
+          | ($kb[0]) as $desired
+          | def isOurs($o):
+              ((($o.name? // "") == $desired.name)
+               or ((($o.command? // "") == $desired.command)
+                   and (($o.args? // "") == $desired.args)));
+          # Old (first) ours if present
+          | ($arr | ensureArr | map(select(type=="object" and isOurs(.))) | .[0]) as $old
+          # Build merged: prefer desired, but for props in $retain keep $old value
+          | ($old // {}) as $o
+          | ($desired // {}) as $d
+          | ( ( ($d|keys) + ($o|keys) ) | unique ) as $allKeys
+          | ( reduce $allKeys[] as $k
+                ( {};
+                  . + { ($k):
+                        ( if ($retain | index($k)) != null
+                          then ( $o[$k] // $d[$k] )
+                          else ( $d[$k] // $o[$k] )
+                        )
+                      }
+                )
+            ) as $merged
+          # New array = everything except old ours, plus merged
+          | ( ensureArr($arr)
+              | map(select(type=="object" and isOurs(.) | not))
+              + [ $merged ] )
+        ' "$CLEAN_KB" > "$KEYB_PATH"
+      rm -f "$CLEAN_KB" "$tmp.kb"
       chown "$PUID:$PGID" "$KEYB_PATH"
-      log "merged keybindings.json (only our binding updated; user bindings preserved) → $KEYB_PATH"
+      log "merged keybindings.json (ours updated; per-property '#' retention honored; others preserved) → $KEYB_PATH"
     else
       write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
       log "created keybindings.json → $KEYB_PATH"
@@ -188,11 +218,9 @@ JSON
 # SETTINGS MERGE (repo settings → user settings)
 # ---------------------------
 install_settings_from_repo() {
-  # Only proceed if the single expected settings file exists
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo bootstrap-settings.json; skipping settings merge"; return 0; }
 
   if ! command -v jq >/dev/null 2>&1; then
-    # Without jq, be conservative: only create if missing
     if [ ! -f "$SETTINGS_PATH" ]; then
       ensure_dir "$USER_DIR"
       cp "$REPO_SETTINGS_SRC" "$SETTINGS_PATH"
@@ -204,7 +232,6 @@ install_settings_from_repo() {
     return 0
   fi
 
-  # Validate repo settings JSON
   if ! jq -e . "$REPO_SETTINGS_SRC" >/dev/null 2>&1; then
     log "WARNING: repo settings JSON invalid → $REPO_SETTINGS_SRC ; skipping settings merge"
     return 0
@@ -213,7 +240,6 @@ install_settings_from_repo() {
   ensure_dir "$STATE_DIR"
   ensure_dir "$USER_DIR"
 
-  # Ensure user settings is an object
   if [ -f "$SETTINGS_PATH" ]; then
     if ! jq -e . "$SETTINGS_PATH" >/dev/null 2>&1; then
       cp "$SETTINGS_PATH" "$SETTINGS_PATH.bak"
@@ -226,7 +252,6 @@ install_settings_from_repo() {
     chown "$PUID:$PGID" "$SETTINGS_PATH"
   fi
 
-  # keys arrays
   RS_KEYS_JSON="$(jq 'keys' "$REPO_SETTINGS_SRC")"
   if [ -f "$MANAGED_KEYS_FILE" ] && jq -e . "$MANAGED_KEYS_FILE" >/dev/null 2>&1; then
     OLD_KEYS_JSON="$(cat "$MANAGED_KEYS_FILE")"
@@ -243,8 +268,8 @@ install_settings_from_repo() {
       def minus($a; $b): [ $a[] | select(contains($b; .) | not) ];
       def delKeys($ks): reduce $ks[] as $k (. ; del(.[$k]));
       (. // {}) as $user
-      | delKeys(minus($oldkeys; $rskeys))   # remove previously managed keys no longer present
-      | . + $repo                           # overlay repo keys (ours take precedence)
+      | delKeys(minus($oldkeys; $rskeys))
+      | . + $repo
     ' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
   chown "$PUID:$PGID" "$SETTINGS_PATH"
   printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"

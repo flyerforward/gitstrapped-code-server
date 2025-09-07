@@ -16,9 +16,9 @@ TASKS_PATH="$USER_DIR/tasks.json"
 KEYB_PATH="$USER_DIR/keybindings.json"
 SETTINGS_PATH="$USER_DIR/settings.json"
 
-STATE_DIR="/config/bootstrap"
+STATE_DIR="/config/.bootstrap"
 MANAGED_KEYS_FILE="$STATE_DIR/managed-settings-keys.json"
-REPO_SETTINGS_SRC="$STATE_DIR/bootstrap-settings.json"   # mount ./settings.json -> /config/bootstrap/bootstrap-settings.json:ro
+REPO_SETTINGS_SRC="$STATE_DIR/bootstrap-settings.json"   # <— JSON lives here now
 
 BASE="${GIT_BASE_DIR:-/config/workspace}"
 SSH_DIR="/config/.ssh"
@@ -33,20 +33,14 @@ mkdir -p "$LOCK_DIR" 2>/dev/null || true
 # ---------------------------
 # UTILS
 # ---------------------------
-# Only chown directory itself; avoid RO bind-mount failures
-ensure_dir(){
-  mkdir -p "$1"
-  chown "$PUID:$PGID" "$1" 2>/dev/null || true
-}
-write_file(){
-  printf "%s" "$2" > "$1"
-  chown "$PUID:$PGID" "$1" 2>/dev/null || true
-}
+ensure_dir(){ mkdir -p "$1"; chown -R "$PUID:$PGID" "$1"; }
+write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 
 # ---------------------------
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
 TASK_LABEL="Bootstrap GitHub Workspace"
+# NOTE: Task passes "force" to bypass autorun lock
 TASK_JSON='{
   "label": "Bootstrap GitHub Workspace",
   "type": "shell",
@@ -92,11 +86,11 @@ install_user_assets() {
     else
       jq 'if type=="array" then . else [] end' "$KEYB_PATH" > "$tmp" && mv "$tmp" "$KEYB_PATH"
     fi
-    chown "$PUID:$PGID" "$KEYB_PATH" 2>/dev/null || true
+    chown "$PUID:$PGID" "$KEYB_PATH"
   fi
 
   if command -v jq >/dev/null 2>&1; then
-    # --- tasks.json merge ---
+    # --- tasks.json merge (replace our task by label; inputs by id) ---
     if [ -f "$TASKS_PATH" ] && jq -e . "$TASKS_PATH" >/dev/null 2>&1; then
       tmp="$(mktemp)"
       printf "%s" "$TASK_JSON"   > "$tmp.task"
@@ -120,7 +114,7 @@ install_user_assets() {
                               map(select(type=="object" and (.id? // null) != $ni.id)) + [ $ni ] ) )
         ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
       rm -f "$tmp.task" "$tmp.inputs"
-      chown "$PUID:$PGID" "$TASKS_PATH" 2>/dev/null || true
+      chown "$PUID:$PGID" "$TASKS_PATH"
       log "merged tasks.json (ours overwritten by label/id) → $TASKS_PATH"
     else
       write_file "$TASKS_PATH" "$(cat <<JSON
@@ -134,7 +128,7 @@ JSON
       log "created tasks.json → $TASKS_PATH"
     fi
 
-    # --- keybindings.json merge ---
+    # --- keybindings.json merge (replace our binding by key+command+args) ---
     if [ -f "$KEYB_PATH" ] && jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
       tmp="$(mktemp)"
       printf "%s" "$KEYB_JSON" > "$tmp.kb"
@@ -150,14 +144,15 @@ JSON
           + [ $kb[0] ]
       ' "$KEYB_PATH" > "$tmp.out" && mv "$tmp.out" "$KEYB_PATH"
       rm -f "$tmp.kb"
-      chown "$PUID:$PGID" "$KEYB_PATH" 2>/dev/null || true
+      chown "$PUID:$PGID" "$KEYB_PATH"
       log "merged keybindings.json (ours overwritten by key+command+args) → $KEYB_PATH"
     else
       write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
       log "created keybindings.json → $KEYB_PATH"
     fi
+
   else
-    # no jq → create-only mode
+    # No jq → create-only (never overwrite)
     if [ ! -f "$TASKS_PATH" ]; then
       write_file "$TASKS_PATH" "$(cat <<JSON
 {
@@ -168,61 +163,84 @@ JSON
 JSON
 )"
       log "created tasks.json (no jq) → $TASKS_PATH"
+    else
+      log "jq not found; tasks.json exists → skipping merge."
     fi
+
     if [ ! -f "$KEYB_PATH" ]; then
       write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
       log "created keybindings.json (no jq) → $KEYB_PATH"
+    else
+      log "jq not found; keybindings.json exists → skipping merge."
     fi
   fi
 }
 
 # ---------------------------
-# SETTINGS MERGE with "#" retention
+# SETTINGS MERGE with "retain via #"
 # ---------------------------
 install_settings_from_repo() {
   ensure_dir "$STATE_DIR"
+
+  # proceed only if the repo settings exists here
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo bootstrap-settings.json; skipping settings merge"; return 0; }
 
   if ! command -v jq >/dev/null 2>&1; then
+    # Without jq, be conservative: only create if missing
     if [ ! -f "$SETTINGS_PATH" ]; then
+      ensure_dir "$USER_DIR"
       cp "$REPO_SETTINGS_SRC" "$SETTINGS_PATH"
-      chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
+      chown "$PUID:$PGID" "$SETTINGS_PATH"
       log "created settings.json from repo (no jq) → $SETTINGS_PATH"
+    else
+      log "jq not found; settings.json exists → skipping merge."
     fi
     return 0
   fi
 
-  # validate repo json
+  # Validate repo settings JSON
   if ! jq -e . "$REPO_SETTINGS_SRC" >/dev/null 2>&1; then
-    log "WARNING: repo settings invalid JSON → $REPO_SETTINGS_SRC"
+    log "WARNING: repo settings JSON invalid → $REPO_SETTINGS_SRC ; skipping settings merge"
     return 0
   fi
 
   ensure_dir "$USER_DIR"
 
-  # extract retained keys
+  # Build RETAIN_KEYS_JSON by grepping lines that end with '#'
+  # Matches e.g.:  "workbench.colorTheme": "Solarized Dark", #
   RETAIN_KEYS_JSON='[]'
   if [ -f "$SETTINGS_PATH" ]; then
+    # produce newline-delimited keys
     RETAIN_KEYS_NL="$(grep -E '^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$' "$SETTINGS_PATH" 2>/dev/null \
       | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/')"
+    # convert to JSON array
     RETAIN_KEYS_JSON="$(printf "%s\n" "$RETAIN_KEYS_NL" | jq -R -s 'split("\n") | map(select(length>0))')"
   fi
 
-  # strip trailing '#' from user file before merging
+  # Strip trailing '#' from user settings lines so JSON is valid
   CLEAN_USER_TMP="$(mktemp)"
   if [ -f "$SETTINGS_PATH" ]; then
     sed 's/[[:space:]]*#[[:space:]]*$//' "$SETTINGS_PATH" > "$CLEAN_USER_TMP"
     if ! jq -e . "$CLEAN_USER_TMP" >/dev/null 2>&1; then
       cp "$SETTINGS_PATH" "$SETTINGS_PATH.bak"
       printf "{}" > "$CLEAN_USER_TMP"
+    else
+      tmpfmt="$(mktemp)"; jq 'if type=="object" then . else {} end' "$CLEAN_USER_TMP" > "$tmpfmt" && mv "$tmpfmt" "$CLEAN_USER_TMP"
     fi
   else
     printf "{}" > "$CLEAN_USER_TMP"
   fi
+  chown "$PUID:$PGID" "$CLEAN_USER_TMP"
 
+  # keys arrays for deletion logic
   RS_KEYS_JSON="$(jq 'keys' "$REPO_SETTINGS_SRC")"
-  OLD_KEYS_JSON="$( [ -f "$MANAGED_KEYS_FILE" ] && jq -e . "$MANAGED_KEYS_FILE" >/dev/null 2>&1 && cat "$MANAGED_KEYS_FILE" || echo '[]' )"
+  if [ -f "$MANAGED_KEYS_FILE" ] && jq -e . "$MANAGED_KEYS_FILE" >/dev/null 2>&1; then
+    OLD_KEYS_JSON="$(cat "$MANAGED_KEYS_FILE")"
+  else
+    OLD_KEYS_JSON='[]'
+  fi
 
+  # Merge: delete old managed keys not in repo (except retained), then overlay repo keys excluding retained keys
   OUT_TMP="$(mktemp)"
   jq \
     --argjson user "$(cat "$CLEAN_USER_TMP")" \
@@ -241,17 +259,18 @@ install_settings_from_repo() {
       | $after_del + $repo_filtered
   ' > "$OUT_TMP"
   mv "$OUT_TMP" "$SETTINGS_PATH"
-  chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
+  chown "$PUID:$PGID" "$SETTINGS_PATH"
 
+  # Persist latest managed keys list (repo keys)
   printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"
-  chown "$PUID:$PGID" "$MANAGED_KEYS_FILE" 2>/dev/null || true
+  chown "$PUID:$PGID" "$MANAGED_KEYS_FILE"
 
   rm -f "$CLEAN_USER_TMP"
   log "merged settings.json (repo overrides; '#' retained keys protected; deletions honored) → $SETTINGS_PATH"
 }
 
 # ---------------------------
-# BOOTSTRAP LOGIC
+# BOOTSTRAP
 # ---------------------------
 resolve_email(){
   EMAILS="$(curl -fsS -H "Authorization: token ${GH_PAT}" -H "Accept: application/vnd.github+json" https://api.github.com/user/emails || true)"
@@ -353,7 +372,7 @@ do_bootstrap(){
         git -C "$dest" pull --ff-only || true
       fi
     else
-      log "clone: ${safe_url} -> ${dest} (branch='\${branch:-default}')"
+      log "clone: ${safe_url} -> ${dest} (branch='${branch:-default}')"
       if [ -n "$branch" ]; then
         git clone --branch "$branch" --single-branch "$url" "$dest" || { log "clone failed: $spec"; return 0; }
       else

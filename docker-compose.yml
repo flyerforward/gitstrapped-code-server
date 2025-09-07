@@ -13,11 +13,10 @@ services:
       GIT_REPOS: "${GIT_REPOS}"
       GIT_BASE_DIR: "/config/workspace"
     volumes:
-      - code-config:/config1
       - code-config:/config
       - projects:/config/workspace
       - ./bootstrap-settings.json:/config/bootstrap/bootstrap-settings.json:ro
-      - ./github-bootstrap.sh:/custom-cont-init.d/10-github-bootstrap.sh:ro
+      - ./bootstrap.sh:/custom-cont-init.d/10-bootstrap.sh:ro
     ports:
       - ":8443"
     restart: always

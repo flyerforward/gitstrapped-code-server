@@ -47,7 +47,7 @@ TASK_JSON='{
   "label": "Bootstrap GitHub Workspace",
   "type": "shell",
   "command": "sh",
-  "args": ["/custom-cont-init.d/10-github-bootstrap.sh", "force"],
+  "args": ["/custom-cont-init.d/10-bootstrap.sh", "force"],
   "options": {
     "env": {
       "GH_USER": "${input:gh_user}",
@@ -66,8 +66,9 @@ INPUTS_JSON='[
   { "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}" },
   { "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
 ]'
-# GLOBAL shortcut (no "when")
+# GLOBAL shortcut (no "when") — now with a "name" to target safely
 KEYB_JSON='{
+  "name": "Bootstrap GitHub Workspace",
   "key": "ctrl+alt+g",
   "command": "workbench.action.tasks.runTask",
   "args": "Bootstrap GitHub Workspace"
@@ -130,24 +131,29 @@ JSON
       log "created tasks.json → $TASKS_PATH"
     fi
 
-    # --- keybindings.json merge (replace our binding by key+command+args) ---
+    # --- keybindings.json merge (replace ONLY our binding by name; keep user bindings) ---
     if [ -f "$KEYB_PATH" ] && jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
       tmp="$(mktemp)"
       printf "%s" "$KEYB_JSON" > "$tmp.kb"
       jq --slurpfile kb "$tmp.kb" '
         def ensureArr(a): if (a|type)=="array" then a else [] end;
         (ensureArr(.)) as $arr
-        | ( $arr
+        | (
+            $arr
             | map(select(type=="object"))
-            | map(select( (.key? // null)     != $kb[0].key
-                          or (.command? // null) != $kb[0].command
-                          or (.args? // null)    != $kb[0].args ))
+            # Keep everything EXCEPT any entry that is our bootstrap binding:
+            #  - Preferred match: .name equals ours
+            #  - Legacy cleanup: command+args equals ours (older versions without "name")
+            | map(select( (
+                            ((.name? // "") == $kb[0].name)
+                            or ( ((.command? // "") == $kb[0].command) and ((.args? // "") == $kb[0].args) )
+                          ) | not ))
           )
           + [ $kb[0] ]
       ' "$KEYB_PATH" > "$tmp.out" && mv "$tmp.out" "$KEYB_PATH"
       rm -f "$tmp.kb"
       chown "$PUID:$PGID" "$KEYB_PATH"
-      log "merged keybindings.json (ours overwritten by key+command+args) → $KEYB_PATH"
+      log "merged keybindings.json (only our binding updated; user bindings preserved) → $KEYB_PATH"
     else
       write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
       log "created keybindings.json → $KEYB_PATH"
@@ -350,7 +356,7 @@ do_bootstrap(){
         git -C "$dest" pull --ff-only || true
       fi
     else
-      log "clone: ${safe_url} -> ${dest} (branch='${branch:-default}')"
+      log "clone: ${safe_url} -> ${dest} (branch='\${branch:-default}')"
       if [ -n "$branch" ]; then
         git clone --branch "$branch" --single-branch "$url" "$dest" || { log "clone failed: $spec"; return 0; }
       else

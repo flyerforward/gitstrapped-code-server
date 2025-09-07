@@ -16,11 +16,9 @@ TASKS_PATH="$USER_DIR/tasks.json"
 KEYB_PATH="$USER_DIR/keybindings.json"
 SETTINGS_PATH="$USER_DIR/settings.json"
 
-# Only this repo settings source
-REPO_SETTINGS_SRC="/custom-cont-init.d/bootstrap-settings.json"
-
 STATE_DIR="/config/.bootstrap"
-MANAGED_KEYS_FILE="$STATE_DIR/managed-settings-keys.json"  # tracks keys we manage for deletion logic
+MANAGED_KEYS_FILE="$STATE_DIR/managed-settings-keys.json"
+REPO_SETTINGS_SRC="$STATE_DIR/bootstrap-settings.json"   # <— JSON lives here now
 
 BASE="${GIT_BASE_DIR:-/config/workspace}"
 SSH_DIR="/config/.ssh"
@@ -180,13 +178,11 @@ JSON
 
 # ---------------------------
 # SETTINGS MERGE with "retain via #"
-# - If a user puts a trailing '#' on a top-level setting line in their current settings.json,
-#   we will NOT override that key from the repo settings for THIS run.
-# - We strip the '#' comments before parsing/merging so settings.json stays valid JSON.
-# - Keys we previously managed but are now absent in repo settings will be removed,
-#   EXCEPT for any keys retained via '#'.
 # ---------------------------
 install_settings_from_repo() {
+  ensure_dir "$STATE_DIR"
+
+  # proceed only if the repo settings exists here
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo bootstrap-settings.json; skipping settings merge"; return 0; }
 
   if ! command -v jq >/dev/null 2>&1; then
@@ -208,35 +204,23 @@ install_settings_from_repo() {
     return 0
   fi
 
-  ensure_dir "$STATE_DIR"
   ensure_dir "$USER_DIR"
 
-  # Prepare a cleaned user settings object and collect "retain via #" keys
+  # Build RETAIN_KEYS_JSON by grepping lines that end with '#'
+  # Matches e.g.:  "workbench.colorTheme": "Solarized Dark", #
   RETAIN_KEYS_JSON='[]'
+  if [ -f "$SETTINGS_PATH" ]; then
+    # produce newline-delimited keys
+    RETAIN_KEYS_NL="$(grep -E '^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$' "$SETTINGS_PATH" 2>/dev/null \
+      | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/')"
+    # convert to JSON array
+    RETAIN_KEYS_JSON="$(printf "%s\n" "$RETAIN_KEYS_NL" | jq -R -s 'split("\n") | map(select(length>0))')"
+  fi
+
+  # Strip trailing '#' from user settings lines so JSON is valid
   CLEAN_USER_TMP="$(mktemp)"
   if [ -f "$SETTINGS_PATH" ]; then
-    # Collect retained keys (lines with trailing # on top-level entries)
-    # Example line matched:   "workbench.colorTheme": "Solarized Dark", #
-    # Also matches objects/arrays; we only need the top-level key name.
-    RETAIN_KEYS_JSON="$(awk '
-      BEGIN{ print "["; first=1 }
-      /^[[:space:]]*\"[^\"]+\"[[:space:]]*:/ {
-        line=$0
-        if (line ~ /#[[:space:]]*$/ || line ~ /#[[:space:]]*[,}][[:space:]]*$/) {
-          if (match(line,/^[[:space:]]*\"([^\"]+)\"[[:space:]]*:/,m)) {
-            if (!first) printf(","); first=0;
-            printf("\"%s\"", m[1]);
-          }
-        }
-      }
-      END{ print "]" }
-    ' "$SETTINGS_PATH")"
-
-    # Strip trailing '#' comments from lines so JSON is valid for jq
-    # (We only strip from end-of-line comments to avoid touching '#' inside strings)
     sed 's/[[:space:]]*#[[:space:]]*$//' "$SETTINGS_PATH" > "$CLEAN_USER_TMP"
-
-    # Ensure JSON object shape
     if ! jq -e . "$CLEAN_USER_TMP" >/dev/null 2>&1; then
       cp "$SETTINGS_PATH" "$SETTINGS_PATH.bak"
       printf "{}" > "$CLEAN_USER_TMP"
@@ -248,7 +232,7 @@ install_settings_from_repo() {
   fi
   chown "$PUID:$PGID" "$CLEAN_USER_TMP"
 
-  # keys arrays
+  # keys arrays for deletion logic
   RS_KEYS_JSON="$(jq 'keys' "$REPO_SETTINGS_SRC")"
   if [ -f "$MANAGED_KEYS_FILE" ] && jq -e . "$MANAGED_KEYS_FILE" >/dev/null 2>&1; then
     OLD_KEYS_JSON="$(cat "$MANAGED_KEYS_FILE")"
@@ -256,7 +240,7 @@ install_settings_from_repo() {
     OLD_KEYS_JSON='[]'
   fi
 
-  # Merge: delete old managed keys not in repo (except retained), then overlay repo keys excluding retained ones
+  # Merge: delete old managed keys not in repo (except retained), then overlay repo keys excluding retained keys
   OUT_TMP="$(mktemp)"
   jq \
     --argjson user "$(cat "$CLEAN_USER_TMP")" \
@@ -264,23 +248,20 @@ install_settings_from_repo() {
     --argjson rskeys "$RS_KEYS_JSON" \
     --argjson oldkeys "$OLD_KEYS_JSON" \
     --argjson retain "$RETAIN_KEYS_JSON" '
-      def indexOf($arr; $x): first( range(0; ($arr|length)) as $i | select($arr[$i] == $x) ) // -1;
-      def containsKey($arr; $k): (indexOf($arr; $k) >= 0);
-      def minus($a; $b): [ $a[] | select(containsKey($b; .) | not) ];
+      def idx($arr; $x): first( range(0; ($arr|length)) as $i | select($arr[$i] == $x) ) // -1;
+      def hasKey($arr; $k): (idx($arr; $k) >= 0);
+      def minus($a; $b): [ $a[] | select(hasKey($b; .) | not) ];
       def delKeys($o; $ks): reduce $ks[] as $k ($o; del(.[$k]));
-      # Keys to delete = old managed keys minus current repo keys, excluding retained keys
       (minus($oldkeys; $rskeys)) as $to_del_all
-      | [ $to_del_all[] | select(containsKey($retain; .) | not) ] as $to_del
-      # Repo overlay but skip retained keys entirely
-      | ($repo | with_entries( select( containsKey($retain; .key) | not ) )) as $repo_filtered
-      # Start with user, delete those to remove, then overlay repo_filtered
+      | [ $to_del_all[] | select(hasKey($retain; .) | not) ] as $to_del
+      | ($repo | with_entries( select( hasKey($retain; .key) | not ) )) as $repo_filtered
       | ($user | delKeys(.; $to_del)) as $after_del
       | $after_del + $repo_filtered
   ' > "$OUT_TMP"
   mv "$OUT_TMP" "$SETTINGS_PATH"
   chown "$PUID:$PGID" "$SETTINGS_PATH"
 
-  # Persist new managed keys list (just the repo keys list)
+  # Persist latest managed keys list (repo keys)
   printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"
   chown "$PUID:$PGID" "$MANAGED_KEYS_FILE"
 

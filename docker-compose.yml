@@ -16,7 +16,7 @@ services:
       - code-config:/config1
       - code-config:/config
       - projects:/config/workspace
-      - ./bootstrap-settings.json:/custom-cont-init.d/bootstrap-settings.json:ro
+      - ./bootstrap-settings.json:/config/.bootstrap/bootstrap-settings.json:ro
       - ./github-bootstrap.sh:/custom-cont-init.d/10-github-bootstrap.sh:ro
     ports:
       - ":8443"

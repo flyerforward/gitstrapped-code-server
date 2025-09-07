@@ -133,33 +133,13 @@ JSON
 
     # --- keybindings.json merge (ONLY our binding; per-property '#' retention) ---
     if [ -f "$KEYB_PATH" ]; then
-      # 1) Determine retained property names (lines ending with '#') within our binding
-      RETAIN_KEYS_JSON="[]"
-      if [ -s "$KEYB_PATH" ]; then
-        RETAIN_KEYS_JSON="$(
-          awk '
-            BEGIN{depth=0; ours=0; saw_cmd=0}
-            {
-              nopen=gsub(/{/,"{"); nclose=gsub(/}/,"}");
-              # enter a new object when depth goes 0->1
-              if (depth==0 && nopen>0) { ours=0; saw_cmd=0 }
-              # detect our binding by name or legacy command+args while inside an object (depth==1)
-              if (depth==1 && $0 ~ /"name"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/) { ours=1 }
-              if (depth==1 && $0 ~ /"command"[[:space:]]*:[[:space:]]*"workbench\.action\.tasks\.runTask"/) { saw_cmd=1 }
-              if (depth==1 && saw_cmd==1 && $0 ~ /"args"[[:space:]]*:[[:space:]]*"Bootstrap GitHub Workspace"/) { ours=1 }
-              # if ours, capture prop names whose line ends with #
-              if (depth==1 && ours==1) {
-                if ($0 ~ /^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$/) {
-                  match($0,/^[[:space:]]*"([^"]+)"[[:space:]]*:/,m);
-                  if (m[1]!="") print m[1];
-                }
-              }
-              depth += nopen - nclose;
-              if (depth<0) depth=0
-            }
-          ' "$KEYB_PATH" | jq -R -s 'split("\n") | map(select(length>0))'
-        )"
-      fi
+      # 1) Collect retained property names (any line in the file whose property ends with a trailing '#')
+      #    This is global-per-property; when we update OUR binding, those properties will be preserved if present there.
+      RETAIN_KEYS_JSON="$(
+        grep -E '^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$' "$KEYB_PATH" 2>/dev/null \
+          | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' \
+          | jq -R -s 'split("\n") | map(select(length>0)) | unique'
+      )"
 
       # 2) Create a cleaned temp (strip trailing '#') so jq can parse; if parsing fails, skip merge to avoid clobber
       CLEAN_KB="$(mktemp)"

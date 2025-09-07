@@ -19,8 +19,6 @@ SETTINGS_PATH="$USER_DIR/settings.json"
 REPO_SETTINGS_SRC="/config/bootstrap/bootstrap-settings.json"
 
 STATE_DIR="/config/.bootstrap"
-MANAGED_KEYS_FILE="$STATE_DIR/managed-settings-keys.json"  # reserved for future use
-
 BASE="${GIT_BASE_DIR:-/config/workspace}"
 SSH_DIR="/config/.ssh"
 KEY_NAME="id_ed25519"
@@ -72,11 +70,12 @@ KEYB_JSON='{
 }'
 
 # ---------------------------
-# INSTALL TASKS (safe merge + bootstrap-preserve)
+# INSTALL TASKS (bootstrap-preserve + ensure present)
 # ---------------------------
 install_tasks() {
   ensure_dir "$USER_DIR"
 
+  # If missing, write fresh file with our task+inputs.
   if [ ! -f "$TASKS_PATH" ]; then
     write_file "$TASKS_PATH" "$(cat <<JSON
 {
@@ -95,11 +94,11 @@ JSON
     return 0
   fi
 
-  tf_dir="$(mktemp -d)"
-  printf "%s" "$TASK_JSON"   > "$tf_dir/desired_task.json"
-  printf "%s" "$INPUTS_JSON" > "$tf_dir/desired_inputs.json"
+  tf="$(mktemp -d)"
+  printf "%s" "$TASK_JSON"   > "$tf/desired_task.json"
+  printf "%s" "$INPUTS_JSON" > "$tf/desired_inputs.json"
 
-  cat > "$tf_dir/filter_tasks.jq" <<'JQ'
+  cat > "$tf/filter_tasks.jq" <<'JQ'
 def ensureObj(o): if (o|type)=="object" then o else {} end;
 def ensureArr(a): if (a|type)=="array"  then a else [] end;
 
@@ -116,51 +115,65 @@ def preserve_merge(old; desired):
       else .
     end;
 
-# start from a valid root object
-(ensureObj(.)) as $root
-| ($root.tasks  // []) as $tasks
-| ($root.inputs // []) as $inputs
-| $root
-| .version = (.version // "2.0.0")
+# Compute new arrays, then rebuild root
+(ensureObj(.)) as $r
+| ($r.tasks  // []) as $tasks
+| ($r.inputs // []) as $inputs
 | ($desiredTask) as $desired
 | (ensureArr($tasks) | map(select(type=="object"))) as $T
 | ($T | map(select((.__name? // "") == $desired.__name)) | if length>0 then .[0] else null end) as $oldStrict
 | ($T | map(select(((.command? // "") == $desired.command) and ((.args? // "") == $desired.args))) | if length>0 then .[0] else null end) as $oldLegacy
 | ($oldStrict // $oldLegacy) as $old
 | (if $old!=null then preserve_merge($old; $desired) else $desired end) as $merged
-| .tasks = (
-    ensureArr($tasks)
-    | map(select(type=="object"))
-    | map(select(
-        ((.__name? // "") == $desired.__name)
-        or (((.command? // "") == $desired.command) and ((.args? // "") == $desired.args))
-      ) | not))
-    + [ $merged ]
-  )
-| .inputs = (
-    ensureArr($inputs)
-    | map(select(type=="object"))
-    | ($desiredInputs as $di
-       | reduce $di[] as $ni
-           ( .;
-             (map(.id) | index($ni.id)) as $idx
-             | if $idx == null then . + [ $ni ] else . end ))
-  )
+| ($T
+   | map(select(
+       ((.__name? // "") == $desired.__name)
+       or (((.command? // "") == $desired.command) and ((.args? // "") == $desired.args))
+     ) | not))
+   + [ $merged ]) as $newTasks
+| ( (ensureArr($inputs))
+    as $I
+    | ($desiredInputs) as $DI
+    | reduce $DI[] as $ni ( $I;
+        (map(.id) | index($ni.id)) as $idx
+        | if $idx == null then . + [ $ni ] else . end )
+  ) as $newInputs
+| $r
+| .version = (.version // "2.0.0")
+| .tasks   = $newTasks
+| .inputs  = $newInputs
 JQ
 
   jq \
-    --argfile desiredTask "$tf_dir/desired_task.json" \
-    --argfile desiredInputs "$tf_dir/desired_inputs.json" \
-    -f "$tf_dir/filter_tasks.jq" \
-    "$TASKS_PATH" > "$tf_dir/out.json" && mv "$tf_dir/out.json" "$TASKS_PATH"
+    --argfile desiredTask   "$tf/desired_task.json" \
+    --argfile desiredInputs "$tf/desired_inputs.json" \
+    -f "$tf/filter_tasks.jq" \
+    "$TASKS_PATH" > "$tf/out.json" && mv "$tf/out.json" "$TASKS_PATH"
+
+  # Fallback: if our task is still missing (for any reason), append it.
+  if ! jq -e '
+      (.tasks // []) | any(
+        . as $t
+        | (($t.__name // "") == "Bootstrap GitHub Workspace")
+          or ( ($t.command // "") == "sh"
+               and ((($t.args // []) | map(tostring) | join(",")) | contains("/custom-cont-init.d/10-bootstrap.sh")) )
+      )
+    ' "$TASKS_PATH" >/dev/null; then
+    jq --argfile desiredTask "$tf/desired_task.json" '
+      .version = (.version // "2.0.0")
+      | .tasks = ((.tasks // []) + [$desiredTask])
+      | .inputs = (.inputs // [])
+    ' "$TASKS_PATH" > "$tf/ensure.json" && mv "$tf/ensure.json" "$TASKS_PATH"
+    log "tasks.json fallback: appended bootstrap task"
+  fi
 
   chown "$PUID:$PGID" "$TASKS_PATH" 2>/dev/null || true
-  rm -rf "$tf_dir"
+  rm -rf "$tf"
   log "merged tasks.json (bootstrap-preserve honored; bootstrap task ensured) → $TASKS_PATH"
 }
 
 # ---------------------------
-# INSTALL KEYBINDING (safe merge + bootstrap-preserve)
+# INSTALL KEYBINDING (bootstrap-preserve + ensure present)
 # ---------------------------
 install_keybinding() {
   ensure_dir "$USER_DIR"
@@ -176,10 +189,10 @@ install_keybinding() {
     return 0
   fi
 
-  tf_dir="$(mktemp -d)"
-  printf "%s" "$KEYB_JSON" > "$tf_dir/desired_kb.json"
+  tf="$(mktemp -d)"
+  printf "%s" "$KEYB_JSON" > "$tf/desired_kb.json"
 
-  cat > "$tf_dir/filter_keyb.jq" <<'JQ'
+  cat > "$tf/filter_keyb.jq" <<'JQ'
 def ensureArr(a): if (a|type)=="array" then a else [] end;
 
 def preserve_merge(old; desired):
@@ -213,12 +226,27 @@ def preserve_merge(old; desired):
 JQ
 
   jq \
-    --argfile desiredKB "$tf_dir/desired_kb.json" \
-    -f "$tf_dir/filter_keyb.jq" \
-    "$KEYB_PATH" > "$tf_dir/out.json" && mv "$tf_dir/out.json" "$KEYB_PATH"
+    --argfile desiredKB "$tf/desired_kb.json" \
+    -f "$tf/filter_keyb.jq" \
+    "$KEYB_PATH" > "$tf/out.json" && mv "$tf/out.json" "$KEYB_PATH"
+
+  # Fallback: ensure present
+  if ! jq -e '
+      ( . // [] ) | any(
+        . as $k
+        | (($k.__name // "") == "Bootstrap GitHub Workspace")
+          or ( (($k.command // "") == "workbench.action.tasks.runTask")
+               and (($k.args // "") == "Bootstrap GitHub Workspace") )
+      )
+    ' "$KEYB_PATH" >/dev/null; then
+    jq --argfile desiredKB "$tf/desired_kb.json" '
+      ( . // [] ) + [ $desiredKB ]
+    ' "$KEYB_PATH" > "$tf/ensure.json" && mv "$tf/ensure.json" "$KEYB_PATH"
+    log "keybindings.json fallback: appended bootstrap keybinding"
+  fi
 
   chown "$PUID:$PGID" "$KEYB_PATH" 2>/dev/null || true
-  rm -rf "$tf_dir"
+  rm -rf "$tf"
   log "merged keybindings.json (bootstrap-preserve honored; bootstrap keybinding ensured) → $KEYB_PATH"
 }
 
@@ -248,10 +276,10 @@ install_settings_from_repo() {
     return 0
   fi
 
-  tf_dir="$(mktemp -d)"
-  cp "$REPO_SETTINGS_SRC" "$tf_dir/repo.json"
+  tf="$(mktemp -d)"
+  cp "$REPO_SETTINGS_SRC" "$tf/repo.json"
 
-  cat > "$tf_dir/filter_settings.jq" <<'JQ'
+  cat > "$tf/filter_settings.jq" <<'JQ'
 def ensureObj(o): if (o|type)=="object" then o else {} end;
 
 (ensureObj(.)) as $user
@@ -265,13 +293,11 @@ def ensureObj(o): if (o|type)=="object" then o else {} end;
   )
 JQ
 
-  jq \
-    --argfile repo "$tf_dir/repo.json" \
-    -f "$tf_dir/filter_settings.jq" \
-    "$SETTINGS_PATH" > "$tf_dir/out.json" && mv "$tf_dir/out.json" "$SETTINGS_PATH"
+  jq --argfile repo "$tf/repo.json" -f "$tf/filter_settings.jq" \
+    "$SETTINGS_PATH" > "$tf/out.json" && mv "$tf/out.json" "$SETTINGS_PATH"
 
   chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
-  rm -rf "$tf_dir"
+  rm -rf "$tf"
   log "merged settings.json (bootstrap-preserve honored) → $SETTINGS_PATH"
 }
 
@@ -411,7 +437,7 @@ if [ "${1:-}" = "force" ]; then
   exit 0
 fi
 
-if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ] ; then
+if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ]; then
   if [ ! -f "$LOCK_FILE" ]; then
     : > "$LOCK_FILE" || true
     log "env present and no lock → running bootstrap"

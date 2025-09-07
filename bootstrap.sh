@@ -16,7 +16,7 @@ TASKS_PATH="$USER_DIR/tasks.json"
 KEYB_PATH="$USER_DIR/keybindings.json"
 SETTINGS_PATH="$USER_DIR/settings.json"
 
-# Only this repo settings source
+# Only this repo settings source (mounted read-only)
 REPO_SETTINGS_SRC="/config/bootstrap/bootstrap-settings.json"
 
 STATE_DIR="/config/.bootstrap"
@@ -35,14 +35,14 @@ mkdir -p "$LOCK_DIR" 2>/dev/null || true
 # ---------------------------
 # UTILS
 # ---------------------------
-ensure_dir(){ mkdir -p "$1"; chown -R "$PUID:$PGID" "$1"; }
-write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
+ensure_dir(){ mkdir -p "$1"; chown -R "$PUID:$PGID" "$1" 2>/dev/null || true; }
+write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1" 2>/dev/null || true; }
 
 # ---------------------------
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
 TASK_LABEL="Bootstrap GitHub Workspace"
-# NOTE: Task passes "force" to bypass autorun lock
+# Task passes "force" to bypass autorun lock
 TASK_JSON='{
   "label": "Bootstrap GitHub Workspace",
   "type": "shell",
@@ -66,7 +66,7 @@ INPUTS_JSON='[
   { "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}" },
   { "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
 ]'
-# GLOBAL shortcut (no "when") — includes "name" for safe targeting
+# GLOBAL shortcut (no "when") — includes "name" so we can target safely
 KEYB_JSON='{
   "name": "Bootstrap GitHub Workspace",
   "key": "ctrl+alt+g",
@@ -80,7 +80,7 @@ KEYB_JSON='{
 install_user_assets() {
   ensure_dir "$USER_DIR"
 
-  # Normalize malformed keybindings.json (must be array)
+  # Normalize malformed keybindings.json (array required)
   if [ -f "$KEYB_PATH" ] && command -v jq >/dev/null 2>&1; then
     tmp="$(mktemp)"
     if ! jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
@@ -89,7 +89,7 @@ install_user_assets() {
     else
       jq 'if type=="array" then . else [] end' "$KEYB_PATH" > "$tmp" && mv "$tmp" "$KEYB_PATH"
     fi
-    chown "$PUID:$PGID" "$KEYB_PATH"
+    chown "$PUID:$PGID" "$KEYB_PATH" 2>/dev/null || true
   fi
 
   if command -v jq >/dev/null 2>&1; then
@@ -117,7 +117,7 @@ install_user_assets() {
                               map(select(type=="object" and (.id? // null) != $ni.id)) + [ $ni ] ) )
         ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
       rm -f "$tmp.task" "$tmp.inputs"
-      chown "$PUID:$PGID" "$TASKS_PATH"
+      chown "$PUID:$PGID" "$TASKS_PATH" 2>/dev/null || true
       log "merged tasks.json (ours overwritten by label/id) → $TASKS_PATH"
     else
       write_file "$TASKS_PATH" "$(cat <<JSON
@@ -131,10 +131,9 @@ JSON
       log "created tasks.json → $TASKS_PATH"
     fi
 
-    # --- keybindings.json merge (ONLY our binding; with per-property retention via '#') ---
+    # --- keybindings.json merge (ONLY our binding; per-property '#' retention) ---
     if [ -f "$KEYB_PATH" ]; then
       # 1) Collect retained property names from raw file (any line ending with '#')
-      #    Example match:   "key": "ctrl+alt+b", #   -> retain prop "key"
       RETAIN_KEYS_JSON="$(grep -E '^[[:space:]]*"[^"]+"[[:space:]]*:[^#]*#[[:space:]]*$' "$KEYB_PATH" 2>/dev/null \
         | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/' \
         | jq -R -s 'split("\n") | map(select(length>0))' )"
@@ -154,15 +153,14 @@ JSON
         --slurpfile kb "$tmp.kb" \
         --argjson retain "${RETAIN_KEYS_JSON:-[]}" '
           def ensureArr(a): if (a|type)=="array" then a else [] end;
+          def isOurs($o; $d):
+            ((($o.name? // "") == $d.name)
+             or ((($o.command? // "") == $d.command)
+                 and (($o.args? // "") == $d.args)));
+
           . as $arr
           | ($kb[0]) as $desired
-          | def isOurs($o):
-              ((($o.name? // "") == $desired.name)
-               or ((($o.command? // "") == $desired.command)
-                   and (($o.args? // "") == $desired.args)));
-          # Old (first) ours if present
-          | ($arr | ensureArr | map(select(type=="object" and isOurs(.))) | .[0]) as $old
-          # Build merged: prefer desired, but for props in $retain keep $old value
+          | (ensureArr($arr) | map(select(type=="object" and isOurs(.; $desired))) | .[0]) as $old
           | ($old // {}) as $o
           | ($desired // {}) as $d
           | ( ( ($d|keys) + ($o|keys) ) | unique ) as $allKeys
@@ -176,13 +174,12 @@ JSON
                       }
                 )
             ) as $merged
-          # New array = everything except old ours, plus merged
           | ( ensureArr($arr)
-              | map(select(type=="object" and isOurs(.) | not))
+              | map(select(type=="object" and (isOurs(.; $desired) | not)))
               + [ $merged ] )
-        ' "$CLEAN_KB" > "$KEYB_PATH"
+      ' "$CLEAN_KB" > "$KEYB_PATH"
       rm -f "$CLEAN_KB" "$tmp.kb"
-      chown "$PUID:$PGID" "$KEYB_PATH"
+      chown "$PUID:$PGID" "$KEYB_PATH" 2>/dev/null || true
       log "merged keybindings.json (ours updated; per-property '#' retention honored; others preserved) → $KEYB_PATH"
     else
       write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
@@ -224,7 +221,7 @@ install_settings_from_repo() {
     if [ ! -f "$SETTINGS_PATH" ]; then
       ensure_dir "$USER_DIR"
       cp "$REPO_SETTINGS_SRC" "$SETTINGS_PATH"
-      chown "$PUID:$PGID" "$SETTINGS_PATH"
+      chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
       log "created settings.json from repo (no jq) → $SETTINGS_PATH"
     else
       log "jq not found; settings.json exists → skipping merge."
@@ -249,7 +246,7 @@ install_settings_from_repo() {
     fi
   else
     printf "{}" > "$SETTINGS_PATH"
-    chown "$PUID:$PGID" "$SETTINGS_PATH"
+    chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
   fi
 
   RS_KEYS_JSON="$(jq 'keys' "$REPO_SETTINGS_SRC")"
@@ -268,12 +265,12 @@ install_settings_from_repo() {
       def minus($a; $b): [ $a[] | select(contains($b; .) | not) ];
       def delKeys($ks): reduce $ks[] as $k (. ; del(.[$k]));
       (. // {}) as $user
-      | delKeys(minus($oldkeys; $rskeys))
-      | . + $repo
+      | delKeys(minus($oldkeys; $rskeys))   # remove previously managed keys no longer present
+      | . + $repo                           # overlay repo keys (ours take precedence)
     ' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
-  chown "$PUID:$PGID" "$SETTINGS_PATH"
+  chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
   printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"
-  chown "$PUID:$PGID" "$MANAGED_KEYS_FILE"
+  chown "$PUID:$PGID" "$MANAGED_KEYS_FILE" 2>/dev/null || true
 
   log "merged settings.json (repo overrides; deletions honored) → $SETTINGS_PATH"
 }
@@ -330,7 +327,7 @@ do_bootstrap(){
 
   touch "$SSH_DIR/known_hosts"
   chmod 644 "$SSH_DIR/known_hosts"
-  chown "$PUID:$PGID" "$SSH_DIR/known_hosts"
+  chown "$PUID:$PGID" "$SSH_DIR/known_hosts" 2>/dev/null || true
   if command -v ssh-keyscan >/dev/null 2>&1 && ! grep -q "^github.com" "$SSH_DIR/known_hosts" 2>/dev/null; then
     ssh-keyscan github.com >> "$SSH_DIR/known_hosts" 2>/dev/null || true
   fi
@@ -388,7 +385,7 @@ do_bootstrap(){
         git clone "$url" "$dest" || { log "clone failed: $spec"; return 0; }
       fi
     fi
-    chown -R "$PUID:$PGID" "$dest" || true
+    chown -R "$PUID:$PGID" "$dest" 2>/dev/null || true
   }
 
   if [ -n "${GIT_REPOS:-}" ]; then

@@ -61,7 +61,6 @@ TASK_JSON='{
   "problemMatcher": []
 }'
 
-# Every desired input is flagged so we can manage/preserve them individually
 INPUTS_JSON='[
   { "__bootstrap_settings": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}" },
   { "__bootstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true },
@@ -142,13 +141,7 @@ install_user_assets() {
               ensureArr($inputs) as $cur
               | ($newinputs[0]) as $desired
               | ($desired | map(select(.id? != null) | .id) | unique) as $dids
-
-              # Keep only inputs whose id is NOT one of our desired ids (dedupe base)
-              | ( $cur
-                  | map(select( ((.id? // "") as $x | ($dids | index($x))) | not ))
-                ) as $others
-
-              # Build merged desired inputs, one per id
+              | ( $cur | map(select( ((.id? // "") as $x | ($dids | index($x))) | not )) ) as $others
               | (
                   $dids
                   | map(
@@ -160,7 +153,6 @@ install_user_assets() {
                       | if $old then merge_with_preserve($old; $inc; $flag) else $inc end
                     )
                 ) as $merged
-
               | $others + $merged
             )
         ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
@@ -238,11 +230,11 @@ JSON
 
 # ---------------------------
 # SETTINGS MERGE (repo settings → user settings) with same-level preserve
-# ENFORCES ordering each run:
+# Enforces ordering each run:
 #   1) all non-repo user keys
 #   2) "__bootstrap_settings": true (marker)
-#   3) ALL repo-managed keys (even if user moved them)
-#   (then preserves values for any keys listed in root bootstrap_preserve)
+#   3) ALL repo-managed keys (even if user moved them above)
+# Preserves values for keys listed in root "bootstrap_preserve".
 # ---------------------------
 install_settings_from_repo() {
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo bootstrap-settings.json; skipping settings merge"; return 0; }
@@ -263,7 +255,7 @@ install_settings_from_repo() {
   ensure_dir "$STATE_DIR"
   ensure_dir "$USER_DIR"
 
-  # Ensure user settings is an object
+  # Ensure user settings is an object (coerce non-objects to {})
   if [ -f "$SETTINGS_PATH" ]; then
     if ! jq -e . "$SETTINGS_PATH" >/dev/null 2>&1; then
       cp "$SETTINGS_PATH" "$SETTINGS_PATH.bak"
@@ -277,6 +269,7 @@ install_settings_from_repo() {
   fi
 
   RS_KEYS_JSON="$(jq 'keys' "$REPO_SETTINGS_SRC")"
+
   if [ -f "$MANAGED_KEYS_FILE" ] && jq -e . "$MANAGED_KEYS_FILE" >/dev/null 2>&1; then
     OLD_KEYS_JSON="$(cat "$MANAGED_KEYS_FILE")"
   else
@@ -289,39 +282,33 @@ install_settings_from_repo() {
     --argjson repo "$(cat "$REPO_SETTINGS_SRC")" \
     --argjson rskeys "$RS_KEYS_JSON" \
     --argjson oldkeys "$OLD_KEYS_JSON" '
-      # Utility
-      def contains($arr; $x): any($arr[]; . == $x);
-      def minus($a; $b): [ $a[] | select(contains($b; .) | not) ];
-      def delKeys($ks): reduce $ks[] as $k (. ; del(.[$k]));
+      # Helpers
+      def minus($a; $b): [ $a[] | select( ($b | index(.)) | not ) ];
+      def delKeys($obj; $ks): reduce $ks[] as $k ($obj; del(.[$k]));
 
-      # Normalize
+      # Normalize user
       (. // {}) as $user
       | ($user.bootstrap_preserve // []) as $pres
 
-      # Cleanup any previously-managed keys no longer in repo
-      | (delKeys(minus($oldkeys; $rskeys))) as $clean_user
+      # Remove previously-managed keys that are no longer present in repo
+      | (delKeys($user; minus($oldkeys; $rskeys))) as $clean_user
 
-      # Split user into:
-      #  - entries NOT managed by repo (to remain above marker)
-      #  - (ignore any current marker / repo-managed entries entirely)
+      # Keep only non-repo user entries (above marker), drop any existing marker
       | ($clean_user
           | to_entries
           | map(select(.key != "__bootstrap_settings" and ($rskeys | index(.key) | not)))
         ) as $user_non_repo_entries
 
-      # Repo entries (managed), *order comes from repo*.
-      | ($repo | to_entries) as $repo_entries
-
-      # Build final object explicitly in order to guarantee placement:
-      | reduce ($user_non_repo_entries)[] as $e ({}; .[$e.key] = $e.value)
+      # Final object build: user-non-repo → marker → repo-keys (preserving values if requested)
+      | reduce $user_non_repo_entries[] as $e ({}; .[$e.key] = $e.value)
       | .["__bootstrap_settings"] = true
-      | ( reduce ($repo_entries)[] as $e
+      | ( reduce $rskeys[] as $k
             ( . ;
-              .[$e.key] =
-                ( if ($pres | index($e.key)) and ($user | has($e.key)) then
-                    $user[$e.key]         # preserve user value, but still placed AFTER the marker
+              .[$k] =
+                ( if ($pres | index($k)) and ($user | has($k)) then
+                    $user[$k]
                   else
-                    $e.value              # repo value
+                    $repo[$k]
                   end )
             )
         )

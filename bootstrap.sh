@@ -42,10 +42,10 @@ write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
 # We mark our objects with a private boolean flag so we can find/replace ONLY ours.
-BOOTSTRAP_FLAG='__bootstraped_setting'
+BOOTSTRAP_FLAG='__bootstrap_setting'
 
 TASK_JSON='{
-  "__bootstraped_setting": true,
+  "__bootstrap_setting": true,
   "label": "Bootstrap GitHub Workspace",
   "type": "shell",
   "command": "sh",
@@ -72,7 +72,7 @@ INPUTS_JSON='[
 
 # GLOBAL shortcut (no "when") — identified solely by our private boolean flag
 KEYB_JSON='{
-  "__bootstraped_setting": true,
+  "__bootstrap_setting": true,
   "key": "ctrl+alt+g",
   "command": "workbench.action.tasks.runTask",
   "args": "Bootstrap GitHub Workspace"
@@ -126,7 +126,7 @@ install_user_assets() {
         ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
       rm -f "$tmp.task" "$tmp.inputs"
       chown "$PUID:$PGID" "$TASKS_PATH"
-      log "merged tasks.json (matched by __bootstraped_setting=true) → $TASKS_PATH"
+      log "merged tasks.json (matched by __bootstrap_setting=true) → $TASKS_PATH"
     else
       write_file "$TASKS_PATH" "$(cat <<JSON
 {
@@ -157,7 +157,7 @@ JSON
       ' "$KEYB_PATH" > "$tmp.out" && mv "$tmp.out" "$KEYB_PATH"
       rm -f "$tmp.kb"
       chown "$PUID:$PGID" "$KEYB_PATH"
-      log "merged keybindings.json (matched by __bootstraped_setting=true) → $KEYB_PATH"
+      log "merged keybindings.json (matched by __bootstrap_setting=true) → $KEYB_PATH"
     else
       write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
       log "created keybindings.json → $KEYB_PATH"

@@ -41,7 +41,7 @@ write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 # ---------------------------
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
-# We mark our objects with a private boolean flag so we can find/replace ONLY ours.
+# We mark our managed objects with a private boolean flag.
 BOOTSTRAP_FLAG='__bootstrap_setting'
 
 TASK_JSON='{
@@ -97,7 +97,7 @@ install_user_assets() {
   fi
 
   if command -v jq >/dev/null 2>&1; then
-    # --- tasks.json merge (replace ONLY entries marked with our boolean flag) ---
+    # --- tasks.json merge (preserve only fields listed in bootstrap_preserve within the same object) ---
     if [ -f "$TASKS_PATH" ] && jq -e . "$TASKS_PATH" >/dev/null 2>&1; then
       tmp="$(mktemp)"
       printf "%s" "$TASK_JSON"   > "$tmp.task"
@@ -108,6 +108,14 @@ install_user_assets() {
         --slurpfile newinputs "$tmp.inputs" '
           def ensureObj(o): if (o|type)=="object" then o else {} end;
           def ensureArr(a): if (a|type)=="array"  then a else [] end;
+
+          # Merge incoming with existing, but preserve ONLY keys listed in .bootstrap_preserve on the SAME OBJECT
+          def merge_with_preserve($old; $incoming; $flag):
+            ($incoming + {($flag): true})
+            | ( .bootstrap_preserve = ( (($old.bootstrap_preserve // []) + (.bootstrap_preserve // [])) | unique ) )
+            | ( reduce (($old.bootstrap_preserve // [])[]) as $k
+                ( . ; .[$k] = ($old[$k] // .[$k]) ) );
+
           (ensureObj(.)) as $root
           | ($root.tasks  // []) as $tasks
           | ($root.inputs // []) as $inputs
@@ -115,8 +123,17 @@ install_user_assets() {
           | .version = ( .version // "2.0.0" )
           | .tasks  = (
               ensureArr($tasks)
-              | map(select(type=="object" and ((.[$flag]? // false) != true)))
-              + [ $newtask[0] ]
+              | (map(
+                  if (type=="object" and ((.[$flag]? // false) == true)) then
+                    merge_with_preserve(.; $newtask[0]; $flag)
+                  else .
+                  end
+                )) as $updated
+              | if any($updated[]; (type=="object" and ((.[$flag]? // false) == true))) then
+                  $updated
+                else
+                  $updated + [ $newtask[0] ]    # add ours if not found
+                end
             )
           | .inputs = (
               ensureArr($inputs)
@@ -126,7 +143,7 @@ install_user_assets() {
         ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
       rm -f "$tmp.task" "$tmp.inputs"
       chown "$PUID:$PGID" "$TASKS_PATH"
-      log "merged tasks.json (matched by __bootstrap_setting=true) → $TASKS_PATH"
+      log "merged tasks.json (preserve at same object level) → $TASKS_PATH"
     else
       write_file "$TASKS_PATH" "$(cat <<JSON
 {
@@ -139,7 +156,7 @@ JSON
       log "created tasks.json → $TASKS_PATH"
     fi
 
-    # --- keybindings.json merge (replace ONLY entries marked with our boolean flag) ---
+    # --- keybindings.json merge (preserve only fields listed in bootstrap_preserve within the same entry) ---
     if [ -f "$KEYB_PATH" ] && jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
       tmp="$(mktemp)"
       printf "%s" "$KEYB_JSON" > "$tmp.kb"
@@ -147,17 +164,29 @@ JSON
         --arg flag "$BOOTSTRAP_FLAG" \
         --slurpfile kb "$tmp.kb" '
         def ensureArr(a): if (a|type)=="array" then a else [] end;
+
+        def merge_with_preserve($old; $incoming; $flag):
+          ($incoming + {($flag): true})
+          | ( .bootstrap_preserve = ( (($old.bootstrap_preserve // []) + (.bootstrap_preserve // [])) | unique ) )
+          | ( reduce (($old.bootstrap_preserve // [])[]) as $k
+              ( . ; .[$k] = ($old[$k] // .[$k]) ) );
+
         (ensureArr(.)) as $arr
-        | (
-            $arr
-            | map(select(type=="object"))
-            | map(select((.[$flag]? // false) != true))
-          )
-          + [ $kb[0] ]
+        | (map(
+            if (type=="object" and ((.[$flag]? // false) == true)) then
+              merge_with_preserve(.; $kb[0]; $flag)
+            else .
+            end
+          )) as $updated
+        | if any($updated[]; (type=="object" and ((.[$flag]? // false) == true))) then
+            $updated
+          else
+            $updated + [ $kb[0] ]
+          end
       ' "$KEYB_PATH" > "$tmp.out" && mv "$tmp.out" "$KEYB_PATH"
       rm -f "$tmp.kb"
       chown "$PUID:$PGID" "$KEYB_PATH"
-      log "merged keybindings.json (matched by __bootstrap_setting=true) → $KEYB_PATH"
+      log "merged keybindings.json (preserve at same entry level) → $KEYB_PATH"
     else
       write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
       log "created keybindings.json → $KEYB_PATH"
@@ -185,8 +214,10 @@ JSON
 }
 
 # ---------------------------
-# SETTINGS MERGE (repo settings → user settings)
+# SETTINGS MERGE (repo settings → user settings) with same-level preserve
 # ---------------------------
+# For VS Code user settings, keys are at the root object.
+# The preserve list MUST also live at the root (same level as those keys).
 install_settings_from_repo() {
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo bootstrap-settings.json; skipping settings merge"; return 0; }
 
@@ -208,6 +239,7 @@ install_settings_from_repo() {
   ensure_dir "$STATE_DIR"
   ensure_dir "$USER_DIR"
 
+  # Ensure user settings is an object
   if [ -f "$SETTINGS_PATH" ]; then
     if ! jq -e . "$SETTINGS_PATH" >/dev/null 2>&1; then
       cp "$SETTINGS_PATH" "$SETTINGS_PATH.bak"
@@ -235,15 +267,22 @@ install_settings_from_repo() {
       def contains($arr; $x): any($arr[]; . == $x);
       def minus($a; $b): [ $a[] | select(contains($b; .) | not) ];
       def delKeys($ks): reduce $ks[] as $k (. ; del(.[$k]));
+
+      # Same-level preserve: read ONLY from the same object (root) that holds the settings
       (. // {}) as $user
-      | delKeys(minus($oldkeys; $rskeys))   # remove previously managed keys no longer present
-      | . + $repo                           # overlay repo keys (ours take precedence)
+      | ($user.bootstrap_preserve // []) as $pres
+      # Remove previously-managed keys that are no longer present in repo settings
+      | delKeys(minus($oldkeys; $rskeys))
+      # Overlay repo settings
+      | ( . + $repo )
+      # Restore user values ONLY for keys listed in bootstrap_preserve at this SAME level
+      | ( reduce $pres[] as $k ( . ; .[$k] = ($user[$k] // .[$k]) ) )
     ' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
   chown "$PUID:$PGID" "$SETTINGS_PATH"
   printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"
   chown "$PUID:$PGID" "$MANAGED_KEYS_FILE"
 
-  log "merged settings.json (repo overrides; deletions honored) → $SETTINGS_PATH"
+  log "merged settings.json (repo overrides; same-level preserved keys honored) → $SETTINGS_PATH"
 }
 
 # ---------------------------
@@ -251,12 +290,12 @@ install_settings_from_repo() {
 # ---------------------------
 resolve_email(){
   EMAILS="$(curl -fsS -H "Authorization: token ${GH_PAT}" -H "Accept: application/vnd.github+json" https://api.github.com/user/emails || true)"
-  PRIMARY="$(printf "%s" "$EMAILS" | awk -F'"' '/"email":/ {e=$4} /"primary": *true/ {print e; exit}')"
+  PRIMARY="$(printf "%s" "$EMAILS" | awk -F\" '/"email":/ {e=$4} /"primary": *true/ {print e; exit}')"
   [ -n "${PRIMARY:-}" ] && { echo "$PRIMARY"; return; }
-  VERIFIED="$(printf "%s" "$EMAILS" | awk -F'"' '/"email":/ {e=$4} /"verified": *true/ {print e; exit}')"
+  VERIFIED="$(printf "%s" "$EMAILS" | awk -F\" '/"email":/ {e=$4} /"verified": *true/ {print e; exit}')"
   [ -n "${VERIFIED:-}" ] && { echo "$VERIFIED"; return; }
   PUB_JSON="$(curl -fsS -H "Accept: application/vnd.github+json" "https://api.github.com/users/${GH_USER}" || true)"
-  PUB_EMAIL="$(printf "%s" "$PUB_JSON" | awk -F'"' '/"email":/ {print $4; exit}')"
+  PUB_EMAIL="$(printf "%s" "$PUB_JSON" | awk -F\" '/"email":/ {print $4; exit}')"
   [ -n "${PUB_EMAIL:-}" ] && [ "$PUB_EMAIL" != "null" ] && { echo "$PUB_EMAIL"; return; }
   echo "${GH_USER}@users.noreply.github.com"
 }
@@ -383,16 +422,13 @@ if [ "${1:-}" = "force" ]; then
 fi
 
 # Otherwise, normal autorun behavior on container start
-if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ]; then
-  if [ ! -f "$LOCK_FILE" ]; then
-    : > "$LOCK_FILE" || true
-    log "env present and no lock → running bootstrap"
-    do_bootstrap || true
-  else
-    log "autorun lock present → skipping duplicate bootstrap this start"
-  fi
+if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ] && [ ! -f "$LOCK_FILE" ]; then
+  : > "$LOCK_FILE" || true
+  log "env present and no lock → running bootstrap"
+  do_bootstrap || true
 else
-  log "GH_USER/GH_PAT missing → skip autorun (use Ctrl+Alt+G or Tasks: Run Task)"
+  [ -f "$LOCK_FILE" ] && log "autorun lock present → skipping duplicate bootstrap this start"
+  { [ -z "${GH_USER:-}" ] || [ -z "${GH_PAT:-}" ]; } && log "GH_USER/GH_PAT missing → skip autorun (use Ctrl+Alt+G or Tasks: Run Task)"
 fi
 
 log "Task + keybinding + (optional) settings installed under: $USER_DIR (reload window if not visible)"

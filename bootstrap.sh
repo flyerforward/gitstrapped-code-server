@@ -41,7 +41,6 @@ write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 # ---------------------------
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
-# We mark our managed objects with a private boolean flag.
 BOOTSTRAP_FLAG='__bootstrap_setting'
 
 TASK_JSON='{
@@ -70,7 +69,6 @@ INPUTS_JSON='[
   { "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
 ]'
 
-# GLOBAL shortcut (no "when") — identified solely by our private boolean flag
 KEYB_JSON='{
   "__bootstrap_setting": true,
   "key": "ctrl+alt+g",
@@ -97,7 +95,7 @@ install_user_assets() {
   fi
 
   if command -v jq >/dev/null 2>&1; then
-    # --- tasks.json merge (preserve only fields listed in bootstrap_preserve within the same object) ---
+    # --- tasks.json merge (preserve fields; restore bootstrap_preserve position) ---
     if [ -f "$TASKS_PATH" ] && jq -e . "$TASKS_PATH" >/dev/null 2>&1; then
       tmp="$(mktemp)"
       printf "%s" "$TASK_JSON"   > "$tmp.task"
@@ -109,12 +107,28 @@ install_user_assets() {
           def ensureObj(o): if (o|type)=="object" then o else {} end;
           def ensureArr(a): if (a|type)=="array"  then a else [] end;
 
-          # Merge incoming with existing, but preserve ONLY keys listed in .bootstrap_preserve on the SAME OBJECT
+          # Move key `k` in object `o` to zero-based index `i` using entry arrays.
+          def move_key(o; k; i):
+            if (i|type) != "number" or i < 0 then o
+            else
+              (o|to_entries) as $e
+              | ($e|map(select(.key==k))) as $kv
+              | if ($kv|length)==0 then o
+                else
+                  ($e|map(select(.key!=k))) as $rest
+                  | ($rest[0:i] + $kv + $rest[i:]) | from_entries
+                end
+            end;
+
+          # Merge incoming with existing, preserve only SAME-object keys listed in bootstrap_preserve,
+          # then put bootstrap_preserve back to its original position from $old (if it had one).
           def merge_with_preserve($old; $incoming; $flag):
-            ($incoming + {($flag): true})
-            | ( .bootstrap_preserve = ( (($old.bootstrap_preserve // []) + (.bootstrap_preserve // [])) | unique ) )
+            ($old|to_entries|map(.key)|index("bootstrap_preserve")) as $old_pos
+            | ($incoming + {($flag): true}) as $inc2
+            | ($inc2 + {bootstrap_preserve: ((($old.bootstrap_preserve // []) + ($inc2.bootstrap_preserve // [])) | unique)}) as $merged
             | ( reduce (($old.bootstrap_preserve // [])[]) as $k
-                ( . ; .[$k] = ($old[$k] // .[$k]) ) );
+                ( $merged ; .[$k] = ($old[$k] // .[$k]) ) ) as $merged2
+            | if $old_pos == null then $merged2 else move_key($merged2; "bootstrap_preserve"; $old_pos) end;
 
           (ensureObj(.)) as $root
           | ($root.tasks  // []) as $tasks
@@ -143,7 +157,7 @@ install_user_assets() {
         ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
       rm -f "$tmp.task" "$tmp.inputs"
       chown "$PUID:$PGID" "$TASKS_PATH"
-      log "merged tasks.json (preserve at same object level) → $TASKS_PATH"
+      log "merged tasks.json (preserve + original preserve-position) → $TASKS_PATH"
     else
       write_file "$TASKS_PATH" "$(cat <<JSON
 {
@@ -156,7 +170,7 @@ JSON
       log "created tasks.json → $TASKS_PATH"
     fi
 
-    # --- keybindings.json merge (preserve only fields listed in bootstrap_preserve within the same entry) ---
+    # --- keybindings.json merge (preserve fields; restore bootstrap_preserve position) ---
     if [ -f "$KEYB_PATH" ] && jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
       tmp="$(mktemp)"
       printf "%s" "$KEYB_JSON" > "$tmp.kb"
@@ -165,11 +179,25 @@ JSON
         --slurpfile kb "$tmp.kb" '
         def ensureArr(a): if (a|type)=="array" then a else [] end;
 
+        def move_key(o; k; i):
+          if (i|type) != "number" or i < 0 then o
+          else
+            (o|to_entries) as $e
+            | ($e|map(select(.key==k))) as $kv
+            | if ($kv|length)==0 then o
+              else
+                ($e|map(select(.key!=k))) as $rest
+                | ($rest[0:i] + $kv + $rest[i:]) | from_entries
+              end
+          end;
+
         def merge_with_preserve($old; $incoming; $flag):
-          ($incoming + {($flag): true})
-          | ( .bootstrap_preserve = ( (($old.bootstrap_preserve // []) + (.bootstrap_preserve // [])) | unique ) )
+          ($old|to_entries|map(.key)|index("bootstrap_preserve")) as $old_pos
+          | ($incoming + {($flag): true}) as $inc2
+          | ($inc2 + {bootstrap_preserve: ((($old.bootstrap_preserve // []) + ($inc2.bootstrap_preserve // [])) | unique)}) as $merged
           | ( reduce (($old.bootstrap_preserve // [])[]) as $k
-              ( . ; .[$k] = ($old[$k] // .[$k]) ) );
+              ( $merged ; .[$k] = ($old[$k] // .[$k]) ) ) as $merged2
+          | if $old_pos == null then $merged2 else move_key($merged2; "bootstrap_preserve"; $old_pos) end;
 
         (ensureArr(.)) as $arr
         | (map(
@@ -186,7 +214,7 @@ JSON
       ' "$KEYB_PATH" > "$tmp.out" && mv "$tmp.out" "$KEYB_PATH"
       rm -f "$tmp.kb"
       chown "$PUID:$PGID" "$KEYB_PATH"
-      log "merged keybindings.json (preserve at same entry level) → $KEYB_PATH"
+      log "merged keybindings.json (preserve + original preserve-position) → $KEYB_PATH"
     else
       write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
       log "created keybindings.json → $KEYB_PATH"
@@ -214,10 +242,8 @@ JSON
 }
 
 # ---------------------------
-# SETTINGS MERGE (repo settings → user settings) with same-level preserve
+# SETTINGS MERGE (repo settings → user settings) with same-level preserve + original position
 # ---------------------------
-# For VS Code user settings, keys are at the root object.
-# The preserve list MUST also live at the root (same level as those keys).
 install_settings_from_repo() {
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo bootstrap-settings.json; skipping settings merge"; return 0; }
 
@@ -268,21 +294,35 @@ install_settings_from_repo() {
       def minus($a; $b): [ $a[] | select(contains($b; .) | not) ];
       def delKeys($ks): reduce $ks[] as $k (. ; del(.[$k]));
 
-      # Same-level preserve: read ONLY from the same object (root) that holds the settings
+      def move_key(o; k; i):
+        if (i|type) != "number" or i < 0 then o
+        else
+          (o|to_entries) as $e
+          | ($e|map(select(.key==k))) as $kv
+          | if ($kv|length)==0 then o
+            else
+              ($e|map(select(.key!=k))) as $rest
+              | ($rest[0:i] + $kv + $rest[i:]) | from_entries
+            end
+        end;
+
       (. // {}) as $user
+      | ($user|to_entries|map(.key)|index("bootstrap_preserve")) as $old_pos
       | ($user.bootstrap_preserve // []) as $pres
       # Remove previously-managed keys that are no longer present in repo settings
       | delKeys(minus($oldkeys; $rskeys))
       # Overlay repo settings
-      | ( . + $repo )
-      # Restore user values ONLY for keys listed in bootstrap_preserve at this SAME level
-      | ( reduce $pres[] as $k ( . ; .[$k] = ($user[$k] // .[$k]) ) )
+      | ( . + $repo ) as $merged
+      # Restore same-level preserved keys from user
+      | ( reduce $pres[] as $k ( $merged ; .[$k] = ($user[$k] // .[$k]) ) ) as $merged2
+      # Put bootstrap_preserve back where the user had it (if it existed)
+      | if $old_pos == null then $merged2 else move_key($merged2; "bootstrap_preserve"; $old_pos) end
     ' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
   chown "$PUID:$PGID" "$SETTINGS_PATH"
   printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"
   chown "$PUID:$PGID" "$MANAGED_KEYS_FILE"
 
-  log "merged settings.json (repo overrides; same-level preserved keys honored) → $SETTINGS_PATH"
+  log "merged settings.json (same-level preserve + original preserve-position) → $SETTINGS_PATH"
 }
 
 # ---------------------------

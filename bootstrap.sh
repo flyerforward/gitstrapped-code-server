@@ -238,8 +238,11 @@ JSON
 
 # ---------------------------
 # SETTINGS MERGE (repo settings → user settings) with same-level preserve
-# Adds a visible "__bootstrap_settings": true marker and places all bootstrap
-# keys AFTER that marker for readability.
+# ENFORCES ordering each run:
+#   1) all non-repo user keys
+#   2) "__bootstrap_settings": true (marker)
+#   3) ALL repo-managed keys (even if user moved them)
+#   (then preserves values for any keys listed in root bootstrap_preserve)
 # ---------------------------
 install_settings_from_repo() {
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo bootstrap-settings.json; skipping settings merge"; return 0; }
@@ -247,15 +250,7 @@ install_settings_from_repo() {
   if ! command -v jq >/dev/null 2>&1; then
     if [ ! -f "$SETTINGS_PATH" ]; then
       ensure_dir "$USER_DIR"
-      # Best-effort: write marker then repo settings (order not guaranteed without jq)
-      write_file "$SETTINGS_PATH" "$(cat <<JSON
-{
-  "__bootstrap_settings": true
-}
-JSON
-)"
-      # append repo settings keys (cannot reliably order without jq; acceptable fallback)
-      tmp="$(mktemp)"; cat "$REPO_SETTINGS_SRC" > "$tmp"; cat "$tmp" >/dev/null 2>&1 || true
+      write_file "$SETTINGS_PATH" '{"__bootstrap_settings": true}'
     fi
     return 0
   fi
@@ -294,41 +289,48 @@ JSON
     --argjson repo "$(cat "$REPO_SETTINGS_SRC")" \
     --argjson rskeys "$RS_KEYS_JSON" \
     --argjson oldkeys "$OLD_KEYS_JSON" '
+      # Utility
       def contains($arr; $x): any($arr[]; . == $x);
       def minus($a; $b): [ $a[] | select(contains($b; .) | not) ];
       def delKeys($ks): reduce $ks[] as $k (. ; del(.[$k]));
 
-      # Base user object normalized
+      # Normalize
       (. // {}) as $user
-
-      # Same-level preserve (root for settings.json)
       | ($user.bootstrap_preserve // []) as $pres
 
-      # Remove previously-managed keys that no longer exist in repo settings
-      | (delKeys(minus($oldkeys; $rskeys)) | .) as $clean_user
+      # Cleanup any previously-managed keys no longer in repo
+      | (delKeys(minus($oldkeys; $rskeys))) as $clean_user
 
-      # Start building the final object in a specific order to keep the marker visible:
-      # 1) all (cleaned) user keys
-      # 2) marker "__bootstrap_settings": true
-      # 3) all repo keys
-      # 4) restore preserved user keys (values only; key positions stay where they were if already present)
-      | ({} 
-          # 1) user keys first (minus any old marker to avoid duplicates)
-          | ( . + ($clean_user | del(.["__bootstrap_settings"])) )
-          # 2) our visible marker
-          | ( .["__bootstrap_settings"] = true )
-          # 3) append all repo keys (bootstrap settings) AFTER the marker
-          | ( reduce ($repo | to_entries[]) as $kv ( . ; .[ $kv.key ] = $kv.value ) )
-          # 4) restore preserved values from original user (does not move key positions)
-          | ( reduce $pres[] as $k ( . ; .[$k] = ($user[$k] // .[$k]) ) )
+      # Split user into:
+      #  - entries NOT managed by repo (to remain above marker)
+      #  - (ignore any current marker / repo-managed entries entirely)
+      | ($clean_user
+          | to_entries
+          | map(select(.key != "__bootstrap_settings" and ($rskeys | index(.key) | not)))
+        ) as $user_non_repo_entries
+
+      # Repo entries (managed), *order comes from repo*.
+      | ($repo | to_entries) as $repo_entries
+
+      # Build final object explicitly in order to guarantee placement:
+      | reduce ($user_non_repo_entries)[] as $e ({}; .[$e.key] = $e.value)
+      | .["__bootstrap_settings"] = true
+      | ( reduce ($repo_entries)[] as $e
+            ( . ;
+              .[$e.key] =
+                ( if ($pres | index($e.key)) and ($user | has($e.key)) then
+                    $user[$e.key]         # preserve user value, but still placed AFTER the marker
+                  else
+                    $e.value              # repo value
+                  end )
+            )
         )
-
     ' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
   chown "$PUID:$PGID" "$SETTINGS_PATH"
   printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"
   chown "$PUID:$PGID" "$MANAGED_KEYS_FILE"
 
-  log "merged settings.json (marker + bootstrap keys after it; same-level preserves honored) → $SETTINGS_PATH"
+  log "merged settings.json (repo keys always below marker; preserves honored) → $SETTINGS_PATH"
 }
 
 # ---------------------------

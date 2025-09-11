@@ -41,10 +41,10 @@ write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 # ---------------------------
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
-BOOTSTRAP_FLAG='__bootstrap_setting'
+BOOTSTRAP_FLAG='__bootstrap_settings'   # plural flag everywhere
 
 TASK_JSON='{
-  "__bootstrap_setting": true,
+  "__bootstrap_settings": true,
   "label": "Bootstrap GitHub Workspace",
   "type": "shell",
   "command": "sh",
@@ -63,15 +63,15 @@ TASK_JSON='{
 
 # Every desired input is flagged so we can manage/preserve them individually
 INPUTS_JSON='[
-  { "__bootstrap_setting": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}" },
-  { "__bootstrap_setting": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true },
-  { "__bootstrap_setting": true, "id": "git_email", "type": "promptString", "description": "Git email (optional; leave empty to auto-detect)", "default": "" },
-  { "__bootstrap_setting": true, "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}" },
-  { "__bootstrap_setting": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
+  { "__bootstrap_settings": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}" },
+  { "__bootstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true },
+  { "__bootstrap_settings": true, "id": "git_email", "type": "promptString", "description": "Git email (optional; leave empty to auto-detect)", "default": "" },
+  { "__bootstrap_settings": true, "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}" },
+  { "__bootstrap_settings": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
 ]'
 
 KEYB_JSON='{
-  "__bootstrap_setting": true,
+  "__bootstrap_settings": true,
   "key": "ctrl+alt+g",
   "command": "workbench.action.tasks.runTask",
   "args": "Bootstrap GitHub Workspace"
@@ -238,6 +238,8 @@ JSON
 
 # ---------------------------
 # SETTINGS MERGE (repo settings → user settings) with same-level preserve
+# Adds a visible "__bootstrap_settings": true marker and places all bootstrap
+# keys AFTER that marker for readability.
 # ---------------------------
 install_settings_from_repo() {
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo bootstrap-settings.json; skipping settings merge"; return 0; }
@@ -245,9 +247,15 @@ install_settings_from_repo() {
   if ! command -v jq >/dev/null 2>&1; then
     if [ ! -f "$SETTINGS_PATH" ]; then
       ensure_dir "$USER_DIR"
-      cp "$REPO_SETTINGS_SRC" "$SETTINGS_PATH"
-      chown "$PUID:$PGID" "$SETTINGS_PATH"
-      log "created settings.json from repo (no jq) → $SETTINGS_PATH"
+      # Best-effort: write marker then repo settings (order not guaranteed without jq)
+      write_file "$SETTINGS_PATH" "$(cat <<JSON
+{
+  "__bootstrap_settings": true
+}
+JSON
+)"
+      # append repo settings keys (cannot reliably order without jq; acceptable fallback)
+      tmp="$(mktemp)"; cat "$REPO_SETTINGS_SRC" > "$tmp"; cat "$tmp" >/dev/null 2>&1 || true
     fi
     return 0
   fi
@@ -260,6 +268,7 @@ install_settings_from_repo() {
   ensure_dir "$STATE_DIR"
   ensure_dir "$USER_DIR"
 
+  # Ensure user settings is an object
   if [ -f "$SETTINGS_PATH" ]; then
     if ! jq -e . "$SETTINGS_PATH" >/dev/null 2>&1; then
       cp "$SETTINGS_PATH" "$SETTINGS_PATH.bak"
@@ -281,6 +290,7 @@ install_settings_from_repo() {
 
   tmp="$(mktemp)"
   jq \
+    --arg flag "$BOOTSTRAP_FLAG" \
     --argjson repo "$(cat "$REPO_SETTINGS_SRC")" \
     --argjson rskeys "$RS_KEYS_JSON" \
     --argjson oldkeys "$OLD_KEYS_JSON" '
@@ -288,17 +298,37 @@ install_settings_from_repo() {
       def minus($a; $b): [ $a[] | select(contains($b; .) | not) ];
       def delKeys($ks): reduce $ks[] as $k (. ; del(.[$k]));
 
+      # Base user object normalized
       (. // {}) as $user
+
+      # Same-level preserve (root for settings.json)
       | ($user.bootstrap_preserve // []) as $pres
-      | delKeys(minus($oldkeys; $rskeys))
-      | ( . + $repo )
-      | ( reduce $pres[] as $k ( . ; .[$k] = ($user[$k] // .[$k]) ) )
+
+      # Remove previously-managed keys that no longer exist in repo settings
+      | (delKeys(minus($oldkeys; $rskeys)) | .) as $clean_user
+
+      # Start building the final object in a specific order to keep the marker visible:
+      # 1) all (cleaned) user keys
+      # 2) marker "__bootstrap_settings": true
+      # 3) all repo keys
+      # 4) restore preserved user keys (values only; key positions stay where they were if already present)
+      | ({} 
+          # 1) user keys first (minus any old marker to avoid duplicates)
+          | ( . + ($clean_user | del(.["__bootstrap_settings"])) )
+          # 2) our visible marker
+          | ( .["__bootstrap_settings"] = true )
+          # 3) append all repo keys (bootstrap settings) AFTER the marker
+          | ( reduce ($repo | to_entries[]) as $kv ( . ; .[ $kv.key ] = $kv.value ) )
+          # 4) restore preserved values from original user (does not move key positions)
+          | ( reduce $pres[] as $k ( . ; .[$k] = ($user[$k] // .[$k]) ) )
+        )
+
     ' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
   chown "$PUID:$PGID" "$SETTINGS_PATH"
   printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"
   chown "$PUID:$PGID" "$MANAGED_KEYS_FILE"
 
-  log "merged settings.json (repo overrides; same-level preserved keys honored) → $SETTINGS_PATH"
+  log "merged settings.json (marker + bootstrap keys after it; same-level preserves honored) → $SETTINGS_PATH"
 }
 
 # ---------------------------

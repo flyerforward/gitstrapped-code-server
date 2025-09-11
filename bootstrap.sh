@@ -62,12 +62,13 @@ TASK_JSON='{
   "problemMatcher": []
 }'
 
+# Mark each input with __bootstrap_setting so we can preserve per-input fields.
 INPUTS_JSON='[
-  { "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}" },
-  { "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true },
-  { "id": "git_email", "type": "promptString", "description": "Git email (optional; leave empty to auto-detect)", "default": "" },
-  { "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}" },
-  { "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
+  { "__bootstrap_setting": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}" },
+  { "__bootstrap_setting": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true },
+  { "__bootstrap_setting": true, "id": "git_email", "type": "promptString", "description": "Git email (optional; leave empty to auto-detect)", "default": "" },
+  { "__bootstrap_setting": true, "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}" },
+  { "__bootstrap_setting": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
 ]'
 
 # GLOBAL shortcut (no "when") — identified solely by our private boolean flag
@@ -79,7 +80,7 @@ KEYB_JSON='{
 }'
 
 # ---------------------------
-# INSTALL/MERGE USER ASSETS (tasks + keybinding)
+# INSTALL/MERGE USER ASSETS (tasks + keybinding + inputs)
 # ---------------------------
 install_user_assets() {
   ensure_dir "$USER_DIR"
@@ -109,7 +110,7 @@ install_user_assets() {
           def ensureObj(o): if (o|type)=="object" then o else {} end;
           def ensureArr(a): if (a|type)=="array"  then a else [] end;
 
-          # Merge incoming with existing, but preserve ONLY keys listed in .bootstrap_preserve on the SAME OBJECT
+          # Merge incoming with existing, preserving ONLY keys listed in .bootstrap_preserve on the SAME OBJECT
           def merge_with_preserve($old; $incoming; $flag):
             ($incoming + {($flag): true})
             | ( .bootstrap_preserve = ( (($old.bootstrap_preserve // []) + (.bootstrap_preserve // [])) | unique ) )
@@ -121,6 +122,8 @@ install_user_assets() {
           | ($root.inputs // []) as $inputs
           | $root
           | .version = ( .version // "2.0.0" )
+
+          # ---- TASKS: update any flagged task(s); add ours if none flagged exists
           | .tasks  = (
               ensureArr($tasks)
               | (map(
@@ -132,18 +135,42 @@ install_user_assets() {
               | if any($updated[]; (type=="object" and ((.[$flag]? // false) == true))) then
                   $updated
                 else
-                  $updated + [ $newtask[0] ]    # add ours if not found
+                  $updated + [ $newtask[0] ]
                 end
             )
+
+          # ---- INPUTS: upsert each desired input by id; preserve per-input fields via bootstrap_preserve
           | .inputs = (
-              ensureArr($inputs)
-              | reduce $newinputs[0][] as $ni
-                  ( . ; map(select(type=="object" and (.id? // null) != $ni.id)) + [ $ni ] )
+              ensureArr($inputs) as $cur
+              # First, update existing flagged inputs that match by id
+              | ( $cur
+                  | map(
+                      if (type=="object" and ((.[$flag]? // false) == true) and (.id? // null) != null) then
+                        # find incoming with same id
+                        ( $newinputs[0] | map(select((.id? // null) != null and (.id == .id))) ) as $noop  # no-op to bind scope
+                        | ( $newinputs[0] | map(select(.id == .id)) ) as $noop2                          # no-op
+                        | ( $newinputs[0] | map(select(.id == .id)) ) as $noop3                          # no-op
+                        # actual lookup:
+                        | ( $newinputs[0] | map(select(.id == .id)) | first ) as $inc
+                        | if $inc then merge_with_preserve(.; $inc; $flag) else . end
+                      else .
+                      end
+                    )
+                ) as $updated
+              # Then, append any desired input not already present with same id+flag
+              | ( reduce $newinputs[0][] as $ni
+                    ( $updated ;
+                      if any( .[]; (type=="object" and ((.[$flag]? // false) == true) and (.id? // null) == ($ni.id // null)) )
+                      then .
+                      else . + [ $ni ]
+                      end
+                    )
+                )
             )
         ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
       rm -f "$tmp.task" "$tmp.inputs"
       chown "$PUID:$PGID" "$TASKS_PATH"
-      log "merged tasks.json (preserve at same object level) → $TASKS_PATH"
+      log "merged tasks.json (tasks & inputs with same-level preserves) → $TASKS_PATH"
     else
       write_file "$TASKS_PATH" "$(cat <<JSON
 {
@@ -186,7 +213,7 @@ JSON
       ' "$KEYB_PATH" > "$tmp.out" && mv "$tmp.out" "$KEYB_PATH"
       rm -f "$tmp.kb"
       chown "$PUID:$PGID" "$KEYB_PATH"
-      log "merged keybindings.json (preserve at same entry level) → $KEYB_PATH"
+      log "merged keybindings.json (same-level preserves) → $KEYB_PATH"
     else
       write_file "$KEYB_PATH" "$(printf '[%s]\n' "$KEYB_JSON")"
       log "created keybindings.json → $KEYB_PATH"
@@ -216,7 +243,7 @@ JSON
 # ---------------------------
 # SETTINGS MERGE (repo settings → user settings) with same-level preserve
 # ---------------------------
-# For VS Code user settings, keys are at the root object.
+# For VS Code user settings, keys live at the root object.
 # The preserve list MUST also live at the root (same level as those keys).
 install_settings_from_repo() {
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo bootstrap-settings.json; skipping settings merge"; return 0; }
@@ -268,14 +295,10 @@ install_settings_from_repo() {
       def minus($a; $b): [ $a[] | select(contains($b; .) | not) ];
       def delKeys($ks): reduce $ks[] as $k (. ; del(.[$k]));
 
-      # Same-level preserve: read ONLY from the same object (root) that holds the settings
       (. // {}) as $user
       | ($user.bootstrap_preserve // []) as $pres
-      # Remove previously-managed keys that are no longer present in repo settings
       | delKeys(minus($oldkeys; $rskeys))
-      # Overlay repo settings
       | ( . + $repo )
-      # Restore user values ONLY for keys listed in bootstrap_preserve at this SAME level
       | ( reduce $pres[] as $k ( . ; .[$k] = ($user[$k] // .[$k]) ) )
     ' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
   chown "$PUID:$PGID" "$SETTINGS_PATH"

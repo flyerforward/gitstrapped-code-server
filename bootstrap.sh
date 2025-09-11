@@ -41,7 +41,7 @@ write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 # ---------------------------
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
-BOOTSTRAP_FLAG='__bootstrap_settings'   # plural flag everywhere
+BOOTSTRAP_FLAG='__bootstrap_settings'
 
 TASK_JSON='{
   "__bootstrap_settings": true,
@@ -291,24 +291,22 @@ install_settings_from_repo() {
       | ($user.bootstrap_preserve // []) as $pres
 
       # Remove previously-managed keys that are no longer present in repo
-      | (delKeys($user; minus($oldkeys; $rskeys))) as $clean_user
+      | (delKeys($user; minus($oldkeys; $rskeys))) as $tmp_user
 
-      # Keep only non-repo user entries (above marker), drop any existing marker
-      | ($clean_user
-          | to_entries
-          | map(select(.key != "__bootstrap_settings" and ($rskeys | index(.key) | not)))
-        ) as $user_non_repo_entries
+      # *** HARD REMOVE of ALL repo keys from user (so they can be re-added after marker) ***
+      | (delKeys($tmp_user; $rskeys)) as $user_without_repo
 
-      # Final object build: user-non-repo → marker → repo-keys (preserving values if requested)
+      # Build final object: non-repo user → marker → repo-managed (with preserves)
+      | ($user_without_repo | to_entries) as $user_non_repo_entries
       | reduce $user_non_repo_entries[] as $e ({}; .[$e.key] = $e.value)
       | .["__bootstrap_settings"] = true
       | ( reduce $rskeys[] as $k
             ( . ;
               .[$k] =
                 ( if ($pres | index($k)) and ($user | has($k)) then
-                    $user[$k]
+                    $user[$k]     # preserve user value, but position AFTER marker
                   else
-                    $repo[$k]
+                    $repo[$k]     # repo default
                   end )
             )
         )

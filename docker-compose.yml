@@ -16,8 +16,8 @@ services:
       - code-config:/config123
       - code-config:/config
       - projects:/config/workspace
-      - ./bootstrap-settings.json:/config/bootstrap/bootstrap-settings.json:ro
-      - ./bootstrap.sh:/custom-cont-init.d/10-bootstrap.sh:ro
+      - ./settings.json:/config/gitstrap/gitstrap-settings.json:ro
+      - ./gitstrap.sh:/custom-cont-init.d/10-gitstrap.sh:ro
     ports:
       - ":8443"
     restart: always

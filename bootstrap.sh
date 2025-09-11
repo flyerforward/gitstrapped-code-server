@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-log(){ echo "[bootstrap] $*"; }
+log(){ echo "[gitstrap] $*"; }
 redact(){ echo "$1" | sed 's/[A-Za-z0-9_\-]\{12,\}/***REDACTED***/g'; }
 
 # ---------------------------
@@ -17,9 +17,9 @@ KEYB_PATH="$USER_DIR/keybindings.json"
 SETTINGS_PATH="$USER_DIR/settings.json"
 
 # Only this repo settings source
-REPO_SETTINGS_SRC="/config/bootstrap/bootstrap-settings.json"
+REPO_SETTINGS_SRC="/config/gitstrap/settings.json"
 
-STATE_DIR="/config/.bootstrap"
+STATE_DIR="/config/.gitstrap"
 MANAGED_KEYS_FILE="$STATE_DIR/managed-settings-keys.json"
 
 BASE="${GIT_BASE_DIR:-/config/workspace}"
@@ -28,7 +28,7 @@ KEY_NAME="id_ed25519"
 PRIVATE_KEY_PATH="$SSH_DIR/$KEY_NAME"
 PUBLIC_KEY_PATH="$SSH_DIR/${KEY_NAME}.pub"
 
-LOCK_DIR="/run/bootstrap"
+LOCK_DIR="/run/gitstrap"
 LOCK_FILE="$LOCK_DIR/autorun.lock"
 mkdir -p "$LOCK_DIR" 2>/dev/null || true
 
@@ -41,14 +41,14 @@ write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 # ---------------------------
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
-BOOTSTRAP_FLAG='__bootstrap_settings'
+GITSTRAP_FLAG='__gitstrap_settings'
 
 TASK_JSON='{
-  "__bootstrap_settings": true,
+  "__gitstrap_settings": true,
   "label": "Bootstrap GitHub Workspace",
   "type": "shell",
   "command": "sh",
-  "args": ["/custom-cont-init.d/10-bootstrap.sh", "force"],
+  "args": ["/custom-cont-init.d/10-gitstrap.sh", "force"],
   "options": {
     "env": {
       "GH_USER": "${input:gh_user}",
@@ -62,15 +62,15 @@ TASK_JSON='{
 }'
 
 INPUTS_JSON='[
-  { "__bootstrap_settings": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}" },
-  { "__bootstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true },
-  { "__bootstrap_settings": true, "id": "git_email", "type": "promptString", "description": "Git email (optional; leave empty to auto-detect)", "default": "" },
-  { "__bootstrap_settings": true, "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}" },
-  { "__bootstrap_settings": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
+  { "__gitstrap_settings": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}" },
+  { "__gitstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true },
+  { "__gitstrap_settings": true, "id": "git_email", "type": "promptString", "description": "Git email (optional; leave empty to auto-detect)", "default": "" },
+  { "__gitstrap_settings": true, "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}" },
+  { "__gitstrap_settings": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
 ]'
 
 KEYB_JSON='{
-  "__bootstrap_settings": true,
+  "__gitstrap_settings": true,
   "key": "ctrl+alt+g",
   "command": "workbench.action.tasks.runTask",
   "args": "Bootstrap GitHub Workspace"
@@ -101,17 +101,17 @@ install_user_assets() {
       printf "%s" "$TASK_JSON"   > "$tmp.task"
       printf "%s" "$INPUTS_JSON" > "$tmp.inputs"
       jq \
-        --arg flag "$BOOTSTRAP_FLAG" \
+        --arg flag "$GITSTRAP_FLAG" \
         --slurpfile newtask "$tmp.task" \
         --slurpfile newinputs "$tmp.inputs" '
           def ensureObj(o): if (o|type)=="object" then o else {} end;
           def ensureArr(a): if (a|type)=="array"  then a else [] end;
 
-          # Merge incoming with existing, preserving ONLY keys listed in .bootstrap_preserve on the SAME OBJECT
+          # Merge incoming with existing, preserving ONLY keys listed in .gitstrap_preserve on the SAME OBJECT
           def merge_with_preserve($old; $incoming; $flag):
             ($incoming + {($flag): true})
-            | ( .bootstrap_preserve = ( (($old.bootstrap_preserve // []) + (.bootstrap_preserve // [])) | unique ) )
-            | ( reduce (($old.bootstrap_preserve // [])[]) as $k
+            | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
+            | ( reduce (($old.gitstrap_preserve // [])[]) as $k
                 ( . ; .[$k] = ($old[$k] // .[$k]) ) );
 
           (ensureObj(.)) as $root
@@ -176,14 +176,14 @@ JSON
       tmp="$(mktemp)"
       printf "%s" "$KEYB_JSON" > "$tmp.kb"
       jq \
-        --arg flag "$BOOTSTRAP_FLAG" \
+        --arg flag "$GITSTRAP_FLAG" \
         --slurpfile kb "$tmp.kb" '
         def ensureArr(a): if (a|type)=="array" then a else [] end;
 
         def merge_with_preserve($old; $incoming; $flag):
           ($incoming + {($flag): true})
-          | ( .bootstrap_preserve = ( (($old.bootstrap_preserve // []) + (.bootstrap_preserve // [])) | unique ) )
-          | ( reduce (($old.bootstrap_preserve // [])[]) as $k
+          | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
+          | ( reduce (($old.gitstrap_preserve // [])[]) as $k
               ( . ; .[$k] = ($old[$k] // .[$k]) ) );
 
         (ensureArr(.)) as $arr
@@ -232,17 +232,17 @@ JSON
 # SETTINGS MERGE (repo settings → user settings) with same-level preserve
 # Enforces ordering each run:
 #   1) all non-repo user keys
-#   2) "__bootstrap_settings": true (marker)
+#   2) "__gitstrap_settings": true (marker)
 #   3) ALL repo-managed keys (even if user moved them above)
-# Preserves values for keys listed in root "bootstrap_preserve".
+# Preserves values for keys listed in root "gitstrap_preserve".
 # ---------------------------
 install_settings_from_repo() {
-  [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo bootstrap-settings.json; skipping settings merge"; return 0; }
+  [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo settings.json; skipping settings merge"; return 0; }
 
   if ! command -v jq >/dev/null 2>&1; then
     if [ ! -f "$SETTINGS_PATH" ]; then
       ensure_dir "$USER_DIR"
-      write_file "$SETTINGS_PATH" '{"__bootstrap_settings": true}'
+      write_file "$SETTINGS_PATH" '{"__gitstrap_settings": true}'
     fi
     return 0
   fi
@@ -278,7 +278,7 @@ install_settings_from_repo() {
 
   tmp="$(mktemp)"
   jq \
-    --arg flag "$BOOTSTRAP_FLAG" \
+    --arg flag "$GITSTRAP_FLAG" \
     --argjson repo "$(cat "$REPO_SETTINGS_SRC")" \
     --argjson rskeys "$RS_KEYS_JSON" \
     --argjson oldkeys "$OLD_KEYS_JSON" '
@@ -288,7 +288,7 @@ install_settings_from_repo() {
 
       # Normalize user
       (. // {}) as $user
-      | ($user.bootstrap_preserve // []) as $pres
+      | ($user.gitstrap_preserve // []) as $pres
 
       # Remove previously-managed keys that are no longer present in repo
       | (delKeys($user; minus($oldkeys; $rskeys))) as $tmp_user
@@ -299,7 +299,7 @@ install_settings_from_repo() {
       # Build final object: non-repo user → marker → repo-managed (with preserves)
       | ($user_without_repo | to_entries) as $user_non_repo_entries
       | reduce $user_non_repo_entries[] as $e ({}; .[$e.key] = $e.value)
-      | .["__bootstrap_settings"] = true
+      | .["__gitstrap_settings"] = true
       | ( reduce $rskeys[] as $k
             ( . ;
               .[$k] =
@@ -333,14 +333,14 @@ resolve_email(){
   echo "${GH_USER}@users.noreply.github.com"
 }
 
-do_bootstrap(){
+do_gitstrap(){
   : "${GH_USER:?GH_USER is required}"
   : "${GH_PAT:?GH_PAT is required}"
 
   GIT_NAME="${GIT_NAME:-$GH_USER}"
   GIT_REPOS="${GIT_REPOS:-}"
 
-  log "bootstrap: user=$GH_USER, name=$GIT_NAME, base=$BASE"
+  log "gitstrap: user=$GH_USER, name=$GIT_NAME, base=$BASE"
   mkdir -p "$BASE" && chown -R "$PUID:$PGID" "$BASE" || true
 
   git config --global init.defaultBranch main || true
@@ -438,7 +438,7 @@ do_bootstrap(){
     log "GIT_REPOS empty; skip clone"
   fi
 
-  log "bootstrap done"
+  log "gitstrap done"
 }
 
 # ---------------------------
@@ -447,20 +447,20 @@ do_bootstrap(){
 install_user_assets
 install_settings_from_repo
 
-# If invoked with "force", always run bootstrap (bypass lock)
+# If invoked with "force", always run gitstrap (bypass lock)
 if [ "${1:-}" = "force" ]; then
   log "manual run (force) → ignoring autorun lock"
-  do_bootstrap
+  do_gitstrap
   exit 0
 fi
 
 # Otherwise, normal autorun behavior on container start
 if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ] && [ ! -f "$LOCK_FILE" ]; then
   : > "$LOCK_FILE" || true
-  log "env present and no lock → running bootstrap"
-  do_bootstrap || true
+  log "env present and no lock → running gitstrap"
+  do_gitstrap || true
 else
-  [ -f "$LOCK_FILE" ] && log "autorun lock present → skipping duplicate bootstrap this start"
+  [ -f "$LOCK_FILE" ] && log "autorun lock present → skipping duplicate gitstrap this start"
   { [ -z "${GH_USER:-}" ] || [ -z "${GH_PAT:-}" ]; } && log "GH_USER/GH_PAT missing → skip autorun (use Ctrl+Alt+G or Tasks: Run Task)"
 fi
 

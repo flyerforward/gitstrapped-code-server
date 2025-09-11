@@ -41,7 +41,6 @@ write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 # ---------------------------
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
-# We mark our managed objects with a private boolean flag.
 BOOTSTRAP_FLAG='__bootstrap_setting'
 
 TASK_JSON='{
@@ -62,7 +61,7 @@ TASK_JSON='{
   "problemMatcher": []
 }'
 
-# Mark each input with __bootstrap_setting so we can preserve per-input fields.
+# Every desired input is flagged so we can manage/preserve them individually
 INPUTS_JSON='[
   { "__bootstrap_setting": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}" },
   { "__bootstrap_setting": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true },
@@ -71,7 +70,6 @@ INPUTS_JSON='[
   { "__bootstrap_setting": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
 ]'
 
-# GLOBAL shortcut (no "when") — identified solely by our private boolean flag
 KEYB_JSON='{
   "__bootstrap_setting": true,
   "key": "ctrl+alt+g",
@@ -98,7 +96,7 @@ install_user_assets() {
   fi
 
   if command -v jq >/dev/null 2>&1; then
-    # --- tasks.json merge (preserve only fields listed in bootstrap_preserve within the same object) ---
+    # --- tasks.json merge (tasks + inputs with same-level preserve support) ---
     if [ -f "$TASKS_PATH" ] && jq -e . "$TASKS_PATH" >/dev/null 2>&1; then
       tmp="$(mktemp)"
       printf "%s" "$TASK_JSON"   > "$tmp.task"
@@ -139,38 +137,36 @@ install_user_assets() {
                 end
             )
 
-          # ---- INPUTS: upsert each desired input by id; preserve per-input fields via bootstrap_preserve
+          # ---- INPUTS: STRICT UPSERT BY id (no duplicates)
           | .inputs = (
               ensureArr($inputs) as $cur
-              # First, update existing flagged inputs that match by id
+              | ($newinputs[0]) as $desired
+              | ($desired | map(select(.id? != null) | .id) | unique) as $dids
+
+              # Keep only inputs whose id is NOT one of our desired ids (dedupe base)
               | ( $cur
+                  | map(select( ((.id? // "") as $x | ($dids | index($x))) | not ))
+                ) as $others
+
+              # Build merged desired inputs, one per id
+              | (
+                  $dids
                   | map(
-                      if (type=="object" and ((.[$flag]? // false) == true) and (.id? // null) != null) then
-                        # find incoming with same id
-                        ( $newinputs[0] | map(select((.id? // null) != null and (.id == .id))) ) as $noop  # no-op to bind scope
-                        | ( $newinputs[0] | map(select(.id == .id)) ) as $noop2                          # no-op
-                        | ( $newinputs[0] | map(select(.id == .id)) ) as $noop3                          # no-op
-                        # actual lookup:
-                        | ( $newinputs[0] | map(select(.id == .id)) | first ) as $inc
-                        | if $inc then merge_with_preserve(.; $inc; $flag) else . end
-                      else .
-                      end
+                      . as $id
+                      | ($desired | map(select(.id == $id)) | first) as $inc
+                      | ($cur | map(select((.id? // "") == $id))) as $matches
+                      | ($matches | map(select((.[$flag]? // false) == true)) | first) as $old_flagged
+                      | (if $old_flagged then $old_flagged else ($matches | first) end) as $old
+                      | if $old then merge_with_preserve($old; $inc; $flag) else $inc end
                     )
-                ) as $updated
-              # Then, append any desired input not already present with same id+flag
-              | ( reduce $newinputs[0][] as $ni
-                    ( $updated ;
-                      if any( .[]; (type=="object" and ((.[$flag]? // false) == true) and (.id? // null) == ($ni.id // null)) )
-                      then .
-                      else . + [ $ni ]
-                      end
-                    )
-                )
+                ) as $merged
+
+              | $others + $merged
             )
         ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
       rm -f "$tmp.task" "$tmp.inputs"
       chown "$PUID:$PGID" "$TASKS_PATH"
-      log "merged tasks.json (tasks & inputs with same-level preserves) → $TASKS_PATH"
+      log "merged tasks.json (tasks & inputs; deduped by id; same-level preserves honored) → $TASKS_PATH"
     else
       write_file "$TASKS_PATH" "$(cat <<JSON
 {
@@ -183,7 +179,7 @@ JSON
       log "created tasks.json → $TASKS_PATH"
     fi
 
-    # --- keybindings.json merge (preserve only fields listed in bootstrap_preserve within the same entry) ---
+    # --- keybindings.json merge (same-level preserves) ---
     if [ -f "$KEYB_PATH" ] && jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
       tmp="$(mktemp)"
       printf "%s" "$KEYB_JSON" > "$tmp.kb"
@@ -243,8 +239,6 @@ JSON
 # ---------------------------
 # SETTINGS MERGE (repo settings → user settings) with same-level preserve
 # ---------------------------
-# For VS Code user settings, keys live at the root object.
-# The preserve list MUST also live at the root (same level as those keys).
 install_settings_from_repo() {
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo bootstrap-settings.json; skipping settings merge"; return 0; }
 
@@ -266,7 +260,6 @@ install_settings_from_repo() {
   ensure_dir "$STATE_DIR"
   ensure_dir "$USER_DIR"
 
-  # Ensure user settings is an object
   if [ -f "$SETTINGS_PATH" ]; then
     if ! jq -e . "$SETTINGS_PATH" >/dev/null 2>&1; then
       cp "$SETTINGS_PATH" "$SETTINGS_PATH.bak"

@@ -41,7 +41,7 @@ write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 # ---------------------------
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
-BOOTSTRAP_FLAG='__bootstrap_settings'
+BOOTSTRAP_FLAG='__bootstrap_settings'   # plural flag everywhere
 
 TASK_JSON='{
   "__bootstrap_settings": true,
@@ -61,6 +61,7 @@ TASK_JSON='{
   "problemMatcher": []
 }'
 
+# Every desired input is flagged so we can manage/preserve them individually
 INPUTS_JSON='[
   { "__bootstrap_settings": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}" },
   { "__bootstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true },
@@ -107,6 +108,7 @@ install_user_assets() {
           def ensureObj(o): if (o|type)=="object" then o else {} end;
           def ensureArr(a): if (a|type)=="array"  then a else [] end;
 
+          # Merge incoming with existing, preserving ONLY keys listed in .bootstrap_preserve on the SAME OBJECT
           def merge_with_preserve($old; $incoming; $flag):
             ($incoming + {($flag): true})
             | ( .bootstrap_preserve = ( (($old.bootstrap_preserve // []) + (.bootstrap_preserve // [])) | unique ) )
@@ -119,7 +121,7 @@ install_user_assets() {
           | $root
           | .version = ( .version // "2.0.0" )
 
-          # ---- TASKS: update flagged task(s); add ours if none exists
+          # ---- TASKS: update any flagged task(s); add ours if none flagged exists
           | .tasks  = (
               ensureArr($tasks)
               | (map(
@@ -140,7 +142,13 @@ install_user_assets() {
               ensureArr($inputs) as $cur
               | ($newinputs[0]) as $desired
               | ($desired | map(select(.id? != null) | .id) | unique) as $dids
-              | ( $cur | map(select( ((.id? // "") as $x | ($dids | index($x))) | not )) ) as $others
+
+              # Keep only inputs whose id is NOT one of our desired ids (dedupe base)
+              | ( $cur
+                  | map(select( ((.id? // "") as $x | ($dids | index($x))) | not ))
+                ) as $others
+
+              # Build merged desired inputs, one per id
               | (
                   $dids
                   | map(
@@ -152,12 +160,13 @@ install_user_assets() {
                       | if $old then merge_with_preserve($old; $inc; $flag) else $inc end
                     )
                 ) as $merged
+
               | $others + $merged
             )
         ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
       rm -f "$tmp.task" "$tmp.inputs"
       chown "$PUID:$PGID" "$TASKS_PATH"
-      log "merged tasks.json (tasks & inputs deduped; same-level preserves) → $TASKS_PATH"
+      log "merged tasks.json (tasks & inputs; deduped by id; same-level preserves honored) → $TASKS_PATH"
     else
       write_file "$TASKS_PATH" "$(cat <<JSON
 {
@@ -229,8 +238,8 @@ JSON
 
 # ---------------------------
 # SETTINGS MERGE (repo settings → user settings) with same-level preserve
-# Enforces ordering: non-repo user keys first, then "__bootstrap_settings": true,
-# then ALL repo-managed keys (even if user had moved them above the marker).
+# Adds a visible "__bootstrap_settings": true marker and places all bootstrap
+# keys AFTER that marker for readability.
 # ---------------------------
 install_settings_from_repo() {
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo bootstrap-settings.json; skipping settings merge"; return 0; }
@@ -238,9 +247,16 @@ install_settings_from_repo() {
   if ! command -v jq >/dev/null 2>&1; then
     if [ ! -f "$SETTINGS_PATH" ]; then
       ensure_dir "$USER_DIR"
-      write_file "$SETTINGS_PATH" '{"__bootstrap_settings": true}'
-      # Without jq we can’t reorder reliably; acceptable fallback.
-    fi>
+      # Best-effort: write marker then repo settings (order not guaranteed without jq)
+      write_file "$SETTINGS_PATH" "$(cat <<JSON
+{
+  "__bootstrap_settings": true
+}
+JSON
+)"
+      # append repo settings keys (cannot reliably order without jq; acceptable fallback)
+      tmp="$(mktemp)"; cat "$REPO_SETTINGS_SRC" > "$tmp"; cat "$tmp" >/dev/null 2>&1 || true
+    fi
     return 0
   fi
 
@@ -278,48 +294,41 @@ install_settings_from_repo() {
     --argjson repo "$(cat "$REPO_SETTINGS_SRC")" \
     --argjson rskeys "$RS_KEYS_JSON" \
     --argjson oldkeys "$OLD_KEYS_JSON" '
-      # $user = current user settings object
+      def contains($arr; $x): any($arr[]; . == $x);
+      def minus($a; $b): [ $a[] | select(contains($b; .) | not) ];
+      def delKeys($ks): reduce $ks[] as $k (. ; del(.[$k]));
+
+      # Base user object normalized
       (. // {}) as $user
+
+      # Same-level preserve (root for settings.json)
       | ($user.bootstrap_preserve // []) as $pres
-      # Remove previously-managed keys that are no longer present in repo (cleanup)
-      | def delKeys($ks): reduce $ks[] as $k (. ; del(.[$k]));
-      | def minus($a; $b): [ $a[] | select( any($b[]; . == .) | not ) ];
-      | (delKeys( minus($oldkeys; $rskeys) )) as $clean_user
 
-      # Build base section: all USER keys EXCEPT the marker and any repo-managed keys
-      | ($clean_user
-          | with_entries(select((.key != "__bootstrap_settings") and ($rskeys | index(.key) | not)))
-        ) as $user_non_repo
+      # Remove previously-managed keys that no longer exist in repo settings
+      | (delKeys(minus($oldkeys; $rskeys)) | .) as $clean_user
 
-      # Start final object:
-      # 1) user non-repo keys
-      # 2) marker
-      # 3) all repo keys in repo order
-      # 4) restore preserved values from original user (if listed in root bootstrap_preserve)
+      # Start building the final object in a specific order to keep the marker visible:
+      # 1) all (cleaned) user keys
+      # 2) marker "__bootstrap_settings": true
+      # 3) all repo keys
+      # 4) restore preserved user keys (values only; key positions stay where they were if already present)
       | ({} 
-         | . + $user_non_repo
-         | .["__bootstrap_settings"] = true
-         | ( reduce $rskeys[] as $k
-             ( . ;
-               .[$k] = (
-                 if ($pres | index($k)) and ($user | has($k)) then
-                   $user[$k]
-                 else
-                   $repo[$k]
-                 end
-               )
-             )
-           )
-        ) as $final
+          # 1) user keys first (minus any old marker to avoid duplicates)
+          | ( . + ($clean_user | del(.["__bootstrap_settings"])) )
+          # 2) our visible marker
+          | ( .["__bootstrap_settings"] = true )
+          # 3) append all repo keys (bootstrap settings) AFTER the marker
+          | ( reduce ($repo | to_entries[]) as $kv ( . ; .[ $kv.key ] = $kv.value ) )
+          # 4) restore preserved values from original user (does not move key positions)
+          | ( reduce $pres[] as $k ( . ; .[$k] = ($user[$k] // .[$k]) ) )
+        )
 
-      # Emit object
-      | $final
     ' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
   chown "$PUID:$PGID" "$SETTINGS_PATH"
   printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"
   chown "$PUID:$PGID" "$MANAGED_KEYS_FILE"
 
-  log "merged settings.json (enforced marker ordering; repo keys always below marker; preserves honored) → $SETTINGS_PATH"
+  log "merged settings.json (marker + bootstrap keys after it; same-level preserves honored) → $SETTINGS_PATH"
 }
 
 # ---------------------------

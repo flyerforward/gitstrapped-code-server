@@ -46,7 +46,7 @@ write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 # ---------------------------
 GITSTRAP_FLAG='__gitstrap_settings'
 
-# Primary bootstrap task (unchanged except naming)
+# Primary bootstrap task
 TASK_JSON='{
   "__gitstrap_settings": true,
   "label": "Bootstrap GitHub Workspace",
@@ -102,7 +102,7 @@ PASSWORD_INPUT_JSON='{
   "gitstrap_preserve": []
 }'
 
-# Global shortcut (unchanged)
+# Global shortcut
 KEYB_JSON='{
   "__gitstrap_settings": true,
   "key": "ctrl+alt+g",
@@ -140,8 +140,10 @@ install_user_assets() {
 
       jq \
         --arg flag "$GITSTRAP_FLAG" \
-        --slurpfile desired_tasks "$tmp.task_bootstrap" "$tmp.task_setpass" \
-        --slurpfile desired_inputs "$tmp.inputs_base" "$tmp.input_setpass" '
+        --slurpfile t_boot "$tmp.task_bootstrap" \
+        --slurpfile t_pass "$tmp.task_setpass" \
+        --slurpfile in_base "$tmp.inputs_base" \
+        --slurpfile in_pass "$tmp.input_setpass" '
           def ensureObj(o): if (o|type)=="object" then o else {} end;
           def ensureArr(a): if (a|type)=="array"  then a else [] end;
 
@@ -160,7 +162,7 @@ install_user_assets() {
           # TASKS: upsert each desired task by gitstrap_task_id (or label if no id)
           | .tasks = (
               ensureArr($tasks) as $cur
-              | ( $desired_tasks | add | ensureArr(.) ) as $want
+              | [ $t_boot[0], $t_pass[0] ] as $want
               | reduce $want[] as $inc (
                   $cur;
                   . as $acc
@@ -187,7 +189,7 @@ install_user_assets() {
           # INPUTS: upsert by id (dedupe)
           | .inputs = (
               ensureArr($inputs) as $cur
-              | ( $desired_inputs | add | ensureArr(.) ) as $want
+              | ( ($in_base[0] + [ $in_pass[0] ]) | ensureArr(.) ) as $want
               | ($want | map(select(.id? != null) | .id) | unique) as $wids
               | ( $cur | map(select( ((.id? // "") as $x | ($wids | index($x))) | not )) ) as $others
               | (
@@ -209,6 +211,7 @@ install_user_assets() {
       chown "$PUID:$PGID" "$TASKS_PATH"
       log "merged tasks.json (2 tasks & inputs; deduped; preserves honored) → $TASKS_PATH"
     else
+      # Create fresh tasks.json
       write_file "$TASKS_PATH" "$(cat <<JSON
 {
   "version": "2.0.0",
@@ -278,8 +281,7 @@ JSON
 }
 
 # ---------------------------
-# SETTINGS MERGE
-# (same as your working version: non-repo → marker → repo keys; preserves honored)
+# SETTINGS MERGE (unchanged logic)
 # ---------------------------
 install_settings_from_repo() {
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo settings.json; skipping settings merge"; return 0; }
@@ -352,7 +354,7 @@ install_settings_from_repo() {
   printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"
   chown "$PUID:$PGID" "$MANAGED_KEYS_FILE"
 
-  log "merged settings.json (repo keys always below marker; preserves honored) → "$SETTINGS_PATH""
+  log "merged settings.json (repo keys always below marker; preserves honored) → $SETTINGS_PATH"
 }
 
 # ---------------------------
@@ -371,7 +373,7 @@ set_password_and_restart() {
       HASH="$(printf "%s" "$GITSTRAP_PASSWORD" | npx -y argon2-cli -e 2>/dev/null || true)"
     else
       log "ERROR: neither 'code-server --hash-password' nor 'npx argon2-cli' is available."
-      log "Install one of them (or bake it into the image) to enable hashed passwords."
+      log "Install one to enable hashed passwords."
       return 1
     fi
   fi

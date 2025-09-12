@@ -38,6 +38,19 @@ mkdir -p "$LOCK_DIR" 2>/dev/null || true
 ensure_dir(){ mkdir -p "$1"; chown -R "$PUID:$PGID" "$1"; }
 write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 
+# Normalize a boolean-ish env/input (default TRUE)
+# Accepts: true/t/yes/y/1/on  -> true
+#          false/f/no/n/0/off -> false
+normalize_bool(){
+  v="${1:-true}"
+  v="$(printf "%s" "$v" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  case "$v" in
+    t*|y*|1|on|true)  echo "true" ;;
+    f*|n*|0|off|false) echo "false" ;;
+    *) echo "true" ;; # default
+  esac
+}
+
 # ---------------------------
 # OUR DESIRED CONFIG OBJECTS
 # ---------------------------
@@ -55,7 +68,8 @@ TASK_JSON='{
       "GH_PAT": "${input:gh_pat}",
       "GIT_EMAIL": "${input:git_email}",
       "GIT_NAME": "${input:git_name}",
-      "GIT_REPOS": "${input:git_repos}"
+      "GIT_REPOS": "${input:git_repos}",
+      "PULL_EXISTING_REPOS": "${input:pull_existing_repos}"
     }
   },
   "problemMatcher": [],
@@ -67,7 +81,8 @@ INPUTS_JSON='[
   { "__gitstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true, "gitstrap_preserve": [] },
   { "__gitstrap_settings": true, "id": "git_email", "type": "promptString", "description": "Git email (optional; leave empty to auto-detect)", "default": "", "gitstrap_preserve": [] },
   { "__gitstrap_settings": true, "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}", "gitstrap_preserve": [] },
-  { "__gitstrap_settings": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}", "gitstrap_preserve": [] }
+  { "__gitstrap_settings": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}", "gitstrap_preserve": [] },
+  { "__gitstrap_settings": true, "id": "pull_existing_repos", "type": "promptString", "description": "Pull existing repos if already cloned? (true/false)", "default": "${env:PULL_EXISTING_REPOS}", "gitstrap_preserve": [] }
 ]'
 
 KEYB_JSON='{
@@ -305,7 +320,7 @@ install_settings_from_repo() {
       | ($user_without_repo | to_entries) as $user_non_repo_entries
       | reduce $user_non_repo_entries[] as $e ({}; .[$e.key] = $e.value)
       | .["__gitstrap_settings"] = true
-      | .["gitstrap_preserve"]  = $pres      # <-- add this line
+      | .["gitstrap_preserve"]  = $pres
       | ( reduce $rskeys[] as $k
             ( . ;
               .[$k] =
@@ -345,8 +360,9 @@ do_gitstrap(){
 
   GIT_NAME="${GIT_NAME:-$GH_USER}"
   GIT_REPOS="${GIT_REPOS:-}"
+  PULL_EXISTING_BOOL="$(normalize_bool "${PULL_EXISTING_REPOS:-true}")"
 
-  log "gitstrap: user=$GH_USER, name=$GIT_NAME, base=$BASE"
+  log "gitstrap: user=$GH_USER, name=$GIT_NAME, base=$BASE, pull_existing_repos=$PULL_EXISTING_BOOL"
   mkdir -p "$BASE" && chown -R "$PUID:$PGID" "$BASE" || true
 
   git config --global init.defaultBranch main || true
@@ -418,13 +434,17 @@ do_gitstrap(){
     safe_url="$(echo "$url" | sed -E 's#(git@github\.com:).*#\1***.git#')"
 
     if [ -d "$dest/.git" ]; then
-      log "pull: ${name}"
-      git -C "$dest" fetch --all -p || true
-      if [ -n "$branch" ]; then
-        git -C "$dest" checkout "$branch" || true
-        git -C "$dest" reset --hard "origin/${branch}" || true
+      if [ "$PULL_EXISTING_BOOL" = "true" ]; then
+        log "pull: ${name}"
+        git -C "$dest" fetch --all -p || true
+        if [ -n "$branch" ]; then
+          git -C "$dest" checkout "$branch" || true
+          git -C "$dest" reset --hard "origin/${branch}" || true
+        else
+          git -C "$dest" pull --ff-only || true
+        fi
       else
-        git -C "$dest" pull --ff-only || true
+        log "skip pull (PULL_EXISTING_REPOS=false): ${name}"
       fi
     else
       log "clone: ${safe_url} -> ${dest} (branch='\${branch:-default}')"

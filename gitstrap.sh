@@ -16,7 +16,7 @@ TASKS_PATH="$USER_DIR/tasks.json"
 KEYB_PATH="$USER_DIR/keybindings.json"
 SETTINGS_PATH="$USER_DIR/settings.json"
 
-# Only this repo settings source
+# Repo-provided settings (copied/managed into settings.json)
 REPO_SETTINGS_SRC="/config/gitstrap/settings.json"
 
 STATE_DIR="/config/.gitstrap"
@@ -32,6 +32,9 @@ LOCK_DIR="/run/gitstrap"
 LOCK_FILE="$LOCK_DIR/autorun.lock"
 mkdir -p "$LOCK_DIR" 2>/dev/null || true
 
+# Hashed password file used by LSIO via FILE__HASHED_PASSWORD
+HASH_FILE="/config/.gitstrap/hashed_password"
+
 # ---------------------------
 # UTILS
 # ---------------------------
@@ -43,6 +46,7 @@ write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 # ---------------------------
 GITSTRAP_FLAG='__gitstrap_settings'
 
+# Primary bootstrap task (unchanged except naming)
 TASK_JSON='{
   "__gitstrap_settings": true,
   "label": "Bootstrap GitHub Workspace",
@@ -62,6 +66,24 @@ TASK_JSON='{
   "gitstrap_preserve": []
 }'
 
+# New task to set / change code-server password
+PASSWORD_TASK_JSON='{
+  "__gitstrap_settings": true,
+  "gitstrap_task_id": "set-password",
+  "label": "Set code-server password",
+  "type": "shell",
+  "command": "sh",
+  "args": ["/custom-cont-init.d/10-gitstrap.sh", "set-password"],
+  "options": {
+    "env": {
+      "GITSTRAP_PASSWORD": "${input:gitstrap_password}"
+    }
+  },
+  "problemMatcher": [],
+  "gitstrap_preserve": []
+}'
+
+# Inputs for both tasks
 INPUTS_JSON='[
   { "__gitstrap_settings": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}", "gitstrap_preserve": [] },
   { "__gitstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true, "gitstrap_preserve": [] },
@@ -70,6 +92,17 @@ INPUTS_JSON='[
   { "__gitstrap_settings": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}", "gitstrap_preserve": [] }
 ]'
 
+# Secret input for the password task
+PASSWORD_INPUT_JSON='{
+  "__gitstrap_settings": true,
+  "id": "gitstrap_password",
+  "type": "promptString",
+  "description": "New code-server password",
+  "password": true,
+  "gitstrap_preserve": []
+}'
+
+# Global shortcut (unchanged)
 KEYB_JSON='{
   "__gitstrap_settings": true,
   "key": "ctrl+alt+g",
@@ -79,7 +112,7 @@ KEYB_JSON='{
 }'
 
 # ---------------------------
-# INSTALL/MERGE USER ASSETS (tasks + keybinding + inputs)
+# INSTALL/MERGE USER ASSETS
 # ---------------------------
 install_user_assets() {
   ensure_dir "$USER_DIR"
@@ -97,19 +130,21 @@ install_user_assets() {
   fi
 
   if command -v jq >/dev/null 2>&1; then
-    # --- tasks.json merge (tasks + inputs with same-level preserve support) ---
+    # --- tasks.json merge (two tasks + inputs with same-level preserve support) ---
     if [ -f "$TASKS_PATH" ] && jq -e . "$TASKS_PATH" >/dev/null 2>&1; then
       tmp="$(mktemp)"
-      printf "%s" "$TASK_JSON"   > "$tmp.task"
-      printf "%s" "$INPUTS_JSON" > "$tmp.inputs"
+      printf "%s" "$TASK_JSON"           > "$tmp.task_bootstrap"
+      printf "%s" "$PASSWORD_TASK_JSON"  > "$tmp.task_setpass"
+      printf "%s" "$INPUTS_JSON"         > "$tmp.inputs_base"
+      printf "%s" "$PASSWORD_INPUT_JSON" > "$tmp.input_setpass"
+
       jq \
         --arg flag "$GITSTRAP_FLAG" \
-        --slurpfile newtask "$tmp.task" \
-        --slurpfile newinputs "$tmp.inputs" '
+        --slurpfile desired_tasks "$tmp.task_bootstrap" "$tmp.task_setpass" \
+        --slurpfile desired_inputs "$tmp.inputs_base" "$tmp.input_setpass" '
           def ensureObj(o): if (o|type)=="object" then o else {} end;
           def ensureArr(a): if (a|type)=="array"  then a else [] end;
 
-          # Merge incoming with existing, preserving ONLY keys listed in .gitstrap_preserve on the SAME OBJECT
           def merge_with_preserve($old; $incoming; $flag):
             ($incoming + {($flag): true})
             | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
@@ -122,33 +157,44 @@ install_user_assets() {
           | $root
           | .version = ( .version // "2.0.0" )
 
-          # ---- TASKS: update any flagged task(s); add ours if none flagged exists
-          | .tasks  = (
-              ensureArr($tasks)
-              | (map(
-                  if (type=="object" and ((.[$flag]? // false) == true)) then
-                    merge_with_preserve(.; $newtask[0]; $flag)
-                  else .
-                  end
-                )) as $updated
-              | if any($updated[]; (type=="object" and ((.[$flag]? // false) == true))) then
-                  $updated
-                else
-                  $updated + [ $newtask[0] ]
-                end
+          # TASKS: upsert each desired task by gitstrap_task_id (or label if no id)
+          | .tasks = (
+              ensureArr($tasks) as $cur
+              | ( $desired_tasks | add | ensureArr(.) ) as $want
+              | reduce $want[] as $inc (
+                  $cur;
+                  . as $acc
+                  | ($inc.gitstrap_task_id // $inc.label) as $id
+                  | ($acc
+                      | map(
+                          if (type=="object"
+                              and ((.[$flag]? // false) == true)
+                              and ((.gitstrap_task_id // .label) == $id))
+                          then merge_with_preserve(.; $inc; $flag)
+                          else .
+                          end
+                        )
+                    ) as $merged
+                  | if any($merged[]; (type=="object"
+                                       and ((.[$flag]? // false) == true)
+                                       and ((.gitstrap_task_id // .label) == $id)))
+                    then $merged
+                    else $merged + [ $inc ]
+                    end
+                )
             )
 
-          # ---- INPUTS: STRICT UPSERT BY id (no duplicates)
+          # INPUTS: upsert by id (dedupe)
           | .inputs = (
               ensureArr($inputs) as $cur
-              | ($newinputs[0]) as $desired
-              | ($desired | map(select(.id? != null) | .id) | unique) as $dids
-              | ( $cur | map(select( ((.id? // "") as $x | ($dids | index($x))) | not )) ) as $others
+              | ( $desired_inputs | add | ensureArr(.) ) as $want
+              | ($want | map(select(.id? != null) | .id) | unique) as $wids
+              | ( $cur | map(select( ((.id? // "") as $x | ($wids | index($x))) | not )) ) as $others
               | (
-                  $dids
+                  $wids
                   | map(
                       . as $id
-                      | ($desired | map(select(.id == $id)) | first) as $inc
+                      | ($want | map(select(.id == $id)) | first) as $inc
                       | ($cur | map(select((.id? // "") == $id))) as $matches
                       | ($matches | map(select((.[$flag]? // false) == true)) | first) as $old_flagged
                       | (if $old_flagged then $old_flagged else ($matches | first) end) as $old
@@ -158,15 +204,16 @@ install_user_assets() {
               | $others + $merged
             )
         ' "$TASKS_PATH" > "$tmp.out" && mv "$tmp.out" "$TASKS_PATH"
-      rm -f "$tmp.task" "$tmp.inputs"
+
+      rm -f "$tmp.task_bootstrap" "$tmp.task_setpass" "$tmp.inputs_base" "$tmp.input_setpass"
       chown "$PUID:$PGID" "$TASKS_PATH"
-      log "merged tasks.json (tasks & inputs; deduped by id; same-level preserves honored) → $TASKS_PATH"
+      log "merged tasks.json (2 tasks & inputs; deduped; preserves honored) → $TASKS_PATH"
     else
       write_file "$TASKS_PATH" "$(cat <<JSON
 {
   "version": "2.0.0",
-  "tasks": [ $TASK_JSON ],
-  "inputs": $INPUTS_JSON
+  "tasks": [ $TASK_JSON, $PASSWORD_TASK_JSON ],
+  "inputs": $(jq -n --argjson a "$INPUTS_JSON" --argjson b "$PASSWORD_INPUT_JSON" '$a + [$b]')
 }
 JSON
 )"
@@ -215,8 +262,8 @@ JSON
       write_file "$TASKS_PATH" "$(cat <<JSON
 {
   "version": "2.0.0",
-  "tasks": [ $TASK_JSON ],
-  "inputs": $INPUTS_JSON
+  "tasks": [ $TASK_JSON, $PASSWORD_TASK_JSON ],
+  "inputs": $(jq -n --argjson a "$INPUTS_JSON" --argjson b "$PASSWORD_INPUT_JSON" '$a + [$b]' 2>/dev/null || echo '[]')
 }
 JSON
 )"
@@ -231,12 +278,8 @@ JSON
 }
 
 # ---------------------------
-# SETTINGS MERGE (repo settings → user settings) with same-level preserve
-# Enforces ordering each run:
-#   1) all non-repo user keys
-#   2) "__gitstrap_settings": true (marker)
-#   3) ALL repo-managed keys (even if user moved them above)
-# Preserves values for keys listed in root "gitstrap_preserve".
+# SETTINGS MERGE
+# (same as your working version: non-repo → marker → repo keys; preserves honored)
 # ---------------------------
 install_settings_from_repo() {
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo settings.json; skipping settings merge"; return 0; }
@@ -260,7 +303,6 @@ install_settings_from_repo() {
   ensure_dir "$STATE_DIR"
   ensure_dir "$USER_DIR"
 
-  # Ensure user settings is an object (coerce non-objects to {})
   if [ -f "$SETTINGS_PATH" ]; then
     if ! jq -e . "$SETTINGS_PATH" >/dev/null 2>&1; then
       cp "$SETTINGS_PATH" "$SETTINGS_PATH.bak"
@@ -287,33 +329,22 @@ install_settings_from_repo() {
     --argjson repo "$(cat "$REPO_SETTINGS_SRC")" \
     --argjson rskeys "$RS_KEYS_JSON" \
     --argjson oldkeys "$OLD_KEYS_JSON" '
-      # Helpers
       def minus($a; $b): [ $a[] | select( ($b | index(.)) | not ) ];
       def delKeys($obj; $ks): reduce $ks[] as $k ($obj; del(.[$k]));
 
-      # Normalize user
       (. // {}) as $user
       | ($user.gitstrap_preserve // []) as $pres
 
-      # Remove previously-managed keys that are no longer present in repo
       | (delKeys($user; minus($oldkeys; $rskeys))) as $tmp_user
-
-      # *** HARD REMOVE of ALL repo keys from user (so they can be re-added after marker) ***
       | (delKeys($tmp_user; $rskeys)) as $user_without_repo
 
-      # Build final object: non-repo user → marker → repo-managed (with preserves)
       | ($user_without_repo | to_entries) as $user_non_repo_entries
       | reduce $user_non_repo_entries[] as $e ({}; .[$e.key] = $e.value)
       | .["__gitstrap_settings"] = true
-      | .["gitstrap_preserve"]  = $pres      # <-- add this line
+      | .["gitstrap_preserve"]  = $pres
       | ( reduce $rskeys[] as $k
             ( . ;
-              .[$k] =
-                ( if ($pres | index($k)) and ($user | has($k)) then
-                    $user[$k]     # preserved value, but placed after the marker
-                  else
-                    $repo[$k]
-                  end )
+              .[$k] = ( if ($pres | index($k)) and ($user | has($k)) then $user[$k] else $repo[$k] end )
             )
         )
     ' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
@@ -321,11 +352,49 @@ install_settings_from_repo() {
   printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"
   chown "$PUID:$PGID" "$MANAGED_KEYS_FILE"
 
-  log "merged settings.json (repo keys always below marker; preserves honored) → $SETTINGS_PATH"
+  log "merged settings.json (repo keys always below marker; preserves honored) → "$SETTINGS_PATH""
 }
 
 # ---------------------------
-# BOOTSTRAP
+# PASSWORD SET / RESTART
+# ---------------------------
+set_password_and_restart() {
+  : "${GITSTRAP_PASSWORD:?GITSTRAP_PASSWORD is required (provided by the Task input)}"
+
+  ensure_dir "$(dirname "$HASH_FILE")"
+
+  # Prefer native code-server hasher; fallback to npx argon2-cli
+  if command -v code-server >/dev/null 2>&1 && code-server --help 2>&1 | grep -q -- "--hash-password"; then
+    HASH="$(code-server --hash-password "$GITSTRAP_PASSWORD" 2>/dev/null || true)"
+  else
+    if command -v npx >/dev/null 2>&1; then
+      HASH="$(printf "%s" "$GITSTRAP_PASSWORD" | npx -y argon2-cli -e 2>/dev/null || true)"
+    else
+      log "ERROR: neither 'code-server --hash-password' nor 'npx argon2-cli' is available."
+      log "Install one of them (or bake it into the image) to enable hashed passwords."
+      return 1
+    fi
+  fi
+
+  [ -n "${HASH:-}" ] || { log "ERROR: failed to generate hash"; return 1; }
+
+  printf "%s\n" "$HASH" > "$HASH_FILE"
+  chown "$PUID:$PGID" "$HASH_FILE"
+  chmod 600 "$HASH_FILE"
+  log "wrote hashed password to $HASH_FILE"
+
+  # Best-effort restart (s6 first; then pkill fallback)
+  if command -v s6-svc >/dev/null 2>&1 && [ -d /run/service/code-server ]; then
+    s6-svc -t /run/service/code-server || s6-svc -r /run/service/code-server || true
+    log "requested code-server restart via s6"
+  else
+    pkill -f "[c]ode-server" || true
+    log "sent pkill to code-server (supervisor may restart it if managed)"
+  fi
+}
+
+# ---------------------------
+# BOOTSTRAP (git operations)
 # ---------------------------
 resolve_email(){
   EMAILS="$(curl -fsS -H "Authorization: token ${GH_PAT}" -H "Accept: application/vnd.github+json" https://api.github.com/user/emails || true)"
@@ -450,17 +519,24 @@ do_gitstrap(){
 # ---------------------------
 # RUN
 # ---------------------------
+
+# Subcommand: set-password
+if [ "${1:-}" = "set-password" ]; then
+  set_password_and_restart
+  exit 0
+fi
+
 install_user_assets
 install_settings_from_repo
 
-# If invoked with "force", always run gitstrap (bypass lock)
+# Subcommand: force (manual bootstrap run)
 if [ "${1:-}" = "force" ]; then
   log "manual run (force) → ignoring autorun lock"
   do_gitstrap
   exit 0
 fi
 
-# Otherwise, normal autorun behavior on container start
+# Autorun behavior on container start
 if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ] && [ ! -f "$LOCK_FILE" ]; then
   : > "$LOCK_FILE" || true
   log "env present and no lock → running gitstrap"
@@ -470,4 +546,4 @@ else
   { [ -z "${GH_USER:-}" ] || [ -z "${GH_PAT:-}" ]; } && log "GH_USER/GH_PAT missing → skip autorun (use Ctrl+Alt+G or Tasks: Run Task)"
 fi
 
-log "Task + keybinding + (optional) settings installed under: $USER_DIR (reload window if not visible)"
+log "Tasks + keybinding + (optional) settings installed under: $USER_DIR (reload window if not visible)"

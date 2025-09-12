@@ -58,22 +58,24 @@ TASK_JSON='{
       "GIT_REPOS": "${input:git_repos}"
     }
   },
-  "problemMatcher": []
+  "problemMatcher": [],
+  "gitstrap_preserve": []
 }'
 
 INPUTS_JSON='[
-  { "__gitstrap_settings": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}" },
-  { "__gitstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true },
-  { "__gitstrap_settings": true, "id": "git_email", "type": "promptString", "description": "Git email (optional; leave empty to auto-detect)", "default": "" },
-  { "__gitstrap_settings": true, "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}" },
-  { "__gitstrap_settings": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}" }
+  { "__gitstrap_settings": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}", "gitstrap_preserve": [] },
+  { "__gitstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true, "gitstrap_preserve": [] },
+  { "__gitstrap_settings": true, "id": "git_email", "type": "promptString", "description": "Git email (optional; leave empty to auto-detect)", "default": "", "gitstrap_preserve": [] },
+  { "__gitstrap_settings": true, "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}", "gitstrap_preserve": [] },
+  { "__gitstrap_settings": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}", "gitstrap_preserve": [] }
 ]'
 
 KEYB_JSON='{
   "__gitstrap_settings": true,
   "key": "ctrl+alt+g",
   "command": "workbench.action.tasks.runTask",
-  "args": "Bootstrap GitHub Workspace"
+  "args": "Bootstrap GitHub Workspace",
+  "gitstrap_preserve": []
 }'
 
 # ---------------------------
@@ -242,7 +244,10 @@ install_settings_from_repo() {
   if ! command -v jq >/dev/null 2>&1; then
     if [ ! -f "$SETTINGS_PATH" ]; then
       ensure_dir "$USER_DIR"
-      write_file "$SETTINGS_PATH" '{"__gitstrap_settings": true}'
+      write_file "$SETTINGS_PATH" '{
+        "__gitstrap_settings": true,
+        "gitstrap_preserve": []
+      }'
     fi
     return 0
   fi
@@ -300,13 +305,14 @@ install_settings_from_repo() {
       | ($user_without_repo | to_entries) as $user_non_repo_entries
       | reduce $user_non_repo_entries[] as $e ({}; .[$e.key] = $e.value)
       | .["__gitstrap_settings"] = true
+      | .["gitstrap_preserve"]  = $pres      # <-- add this line
       | ( reduce $rskeys[] as $k
             ( . ;
               .[$k] =
                 ( if ($pres | index($k)) and ($user | has($k)) then
-                    $user[$k]     # preserve user value, but position AFTER marker
+                    $user[$k]     # preserved value, but placed after the marker
                   else
-                    $repo[$k]     # repo default
+                    $repo[$k]
                   end )
             )
         )

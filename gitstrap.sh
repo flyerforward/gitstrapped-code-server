@@ -32,8 +32,9 @@ LOCK_DIR="/run/gitstrap"
 LOCK_FILE="$LOCK_DIR/autorun.lock"
 mkdir -p "$LOCK_DIR" 2>/dev/null || true
 
-# Hashed password file used by LSIO via FILE__HASHED_PASSWORD
-HASH_FILE="/config/.gitstrap/hashed_password"
+# code-server config file (authoritative for auth)
+CS_CFG_DIR="/config/.config/code-server"
+CS_CFG_FILE="$CS_CFG_DIR/config.yaml"
 
 # ---------------------------
 # UTILS
@@ -66,7 +67,7 @@ TASK_JSON='{
   "gitstrap_preserve": []
 }'
 
-# New task to set / change code-server password
+# Task to set / change code-server password
 PASSWORD_TASK_JSON='{
   "__gitstrap_settings": true,
   "gitstrap_task_id": "set-password",
@@ -102,7 +103,7 @@ PASSWORD_INPUT_JSON='{
   "gitstrap_preserve": []
 }'
 
-# Global shortcut
+# Global shortcut for the bootstrap task
 KEYB_JSON='{
   "__gitstrap_settings": true,
   "key": "ctrl+alt+g",
@@ -211,7 +212,6 @@ install_user_assets() {
       chown "$PUID:$PGID" "$TASKS_PATH"
       log "merged tasks.json (2 tasks & inputs; deduped; preserves honored) → $TASKS_PATH"
     else
-      # Create fresh tasks.json
       write_file "$TASKS_PATH" "$(cat <<JSON
 {
   "version": "2.0.0",
@@ -360,32 +360,57 @@ install_settings_from_repo() {
 # ---------------------------
 # PASSWORD SET / RESTART
 # ---------------------------
-set_password_and_restart() {
-  : "${GITSTRAP_PASSWORD:?GITSTRAP_PASSWORD is required (provided by the Task input)}"
 
-  ensure_dir "$(dirname "$HASH_FILE")"
-
-  # Prefer native code-server hasher; fallback to npx argon2-cli
-  if command -v code-server >/dev/null 2>&1 && code-server --help 2>&1 | grep -q -- "--hash-password"; then
-    HASH="$(code-server --hash-password "$GITSTRAP_PASSWORD" 2>/dev/null || true)"
-  else
-    if command -v npx >/dev/null 2>&1; then
-      HASH="$(printf "%s" "$GITSTRAP_PASSWORD" | npx -y argon2-cli -e 2>/dev/null || true)"
-    else
-      log "ERROR: neither 'code-server --hash-password' nor 'npx argon2-cli' is available."
-      log "Install one to enable hashed passwords."
-      return 1
-    fi
+# Try to find a usable code-server binary
+_find_code_server() {
+  if command -v code-server >/dev/null 2>&1; then
+    echo "$(command -v code-server)"
+    return 0
   fi
+  for p in \
+    /usr/bin/code-server \
+    /usr/local/bin/code-server \
+    /app/code-server/bin/code-server \
+    /usr/lib/code-server/bin/code-server \
+    /opt/code-server/bin/code-server
+  do
+    [ -x "$p" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
 
-  [ -n "${HASH:-}" ] || { log "ERROR: failed to generate hash"; return 1; }
+# Hash password using code-server (preferred)
+_hash_with_code_server() {
+  CS_BIN="$(_find_code_server)" || return 1
+  # Some builds don’t show --hash-password in --help even though it works. Just try it.
+  "$CS_BIN" --hash-password "$1" 2>/dev/null || return 1
+  return 0
+}
 
-  printf "%s\n" "$HASH" > "$HASH_FILE"
-  chown "$PUID:$PGID" "$HASH_FILE"
-  chmod 600 "$HASH_FILE"
-  log "wrote hashed password to $HASH_FILE"
+# Write/update config.yaml with auth + hashed-password (preserving other lines)
+_write_config_with_hash() {
+  ensure_dir "$CS_CFG_DIR"
+  [ -f "$CS_CFG_FILE" ] || touch "$CS_CFG_FILE"
 
-  # Best-effort restart (s6 first; then pkill fallback)
+  tmp="$(mktemp)"
+  # Remove any existing auth/hashed-password lines, keep the rest verbatim, then append ours.
+  # (simple YAML mutation good enough for these flat keys)
+  awk '
+    BEGIN { IGNORECASE=0 }
+    !/^[[:space:]]*auth[[:space:]]*:/ && !/^[[:space:]]*hashed-password[[:space:]]*:/ { print }
+  ' "$CS_CFG_FILE" > "$tmp"
+
+  {
+    echo "auth: password"
+    printf 'hashed-password: "%s"\n' "$1"
+  } >> "$tmp"
+
+  mv "$tmp" "$CS_CFG_FILE"
+  chown "$PUID:$PGID" "$CS_CFG_FILE"
+  log "updated $CS_CFG_FILE with hashed password"
+}
+
+_restart_code_server() {
   if command -v s6-svc >/dev/null 2>&1 && [ -d /run/service/code-server ]; then
     s6-svc -t /run/service/code-server || s6-svc -r /run/service/code-server || true
     log "requested code-server restart via s6"
@@ -393,6 +418,25 @@ set_password_and_restart() {
     pkill -f "[c]ode-server" || true
     log "sent pkill to code-server (supervisor may restart it if managed)"
   fi
+}
+
+set_password_and_restart() {
+  : "${GITSTRAP_PASSWORD:?GITSTRAP_PASSWORD is required (provided by the Task input)}"
+
+  HASH="$(_hash_with_code_server "$GITSTRAP_PASSWORD" || true)"
+  if [ -z "${HASH:-}" ]; then
+    log "ERROR: could not find a usable code-server hasher in PATH or known locations."
+    log "Paths tried: command -v, /usr/bin, /usr/local/bin, /app/code-server/bin, /usr/lib/code-server/bin, /opt/code-server/bin"
+    exit 1
+  fi
+  # Expect a PHC string like $argon2id$...
+  case "$HASH" in
+    \$argon2* ) ;;
+    * ) log "ERROR: unexpected hash output from code-server"; exit 1;;
+  esac
+
+  _write_config_with_hash "$HASH"
+  _restart_code_server
 }
 
 # ---------------------------
@@ -453,7 +497,7 @@ do_gitstrap(){
   fi
 
   git config --global core.sshCommand \
-    "ssh -i $PRIVATE_KEY_PATH -F /dev/null -o IdentitiesOnly=yes -o UserKnownHostsFile=$SSH_DIR/known_hosts -o StrictHostKeyChecking=accept-new"
+    "ssh -i $PRIVATE_KEY_PATH -F /null -o IdentitiesOnly=yes -o UserKnownHostsFile=$SSH_DIR/known_hosts -o StrictHostKeyChecking=accept-new"
 
   LOCAL_KEY="$(awk '{print $1" "$2}' "$PUBLIC_KEY_PATH")"
   TITLE="${GH_KEY_TITLE:-Docker SSH Key}"

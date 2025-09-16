@@ -37,10 +37,6 @@ services:
     container_name: code-server-restartd
     depends_on:
       - code
-    environment:
-      CONTAINER_NAME: "code-server"
-      PASSWORD_FILE: "/config/.gitstrap/codepass.txt"
-      DOCKER_SOCK: "/var/run/docker.sock"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock     # RW so it can call Docker API
       - code-config:/config:ro                        # read the same /config volume
@@ -49,18 +45,15 @@ services:
       - -eu
       - -c
       - |
-          : "$/config/.gitstrap/codepass.txt"
-          : "${CONTAINER_NAME:?CONTAINER_NAME not set}"
-          : "${DOCKER_SOCK:=/var/run/docker.sock}"
-          echo "[restartd] watching /config/.gitstrap/codepass.txt for changes to restart ${CONTAINER_NAME}"
+          echo "[restartd] watching /config/.gitstrap/codepass.txt for changes to restart code-server"
           last=""
           while :; do
             cur="$(cat "/config/.gitstrap/codepass.txt" 2>/dev/null || true)"
             if [ -n "${cur}" ] && [ "${cur}" != "${last}" ]; then
               last="${cur}"
-              echo "[restartd] change detected; requesting restart of ${CONTAINER_NAME}"
-              code="$(curl --unix-socket "${DOCKER_SOCK}" -s -o /dev/null -w '%{http_code}' \
-                -X POST "http://localhost/v1.41/containers/${CONTAINER_NAME}/restart" || true)"
+              echo "[restartd] change detected; requesting restart of code-server"
+              code="$(curl --unix-socket "/var/run/docker.sock" -s -o /dev/null -w '%{http_code}' \
+                -X POST "http://localhost/v1.41/containers/code-server/restart" || true)"
               echo "[restartd] docker api returned ${code}"
             fi
             sleep 2

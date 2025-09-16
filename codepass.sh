@@ -9,7 +9,7 @@ PGID="${PGID:-1000}"
 export HOME="${HOME:-/config}"
 
 STATE_DIR="$HOME/.gitstrap"
-HASH_FILE="$STATE_DIR/codepass.hash"   # <-- hashed password file (used via FILE__HASHED_PASSWORD)
+HASH_FILE="$STATE_DIR/codepass.hash"   # used via FILE__HASHED_PASSWORD
 
 TASKS="$HOME/data/User/tasks.json"
 KEYB="$HOME/data/User/keybindings.json"
@@ -98,25 +98,34 @@ JSON
   log "installed VS Code task & keybinding"
 }
 
-# ---- hashing helpers (Argon2) ----
-try_hash_with(){
-  prog="$1"; shift
-  if command -v "$prog" >/dev/null 2>&1; then
-    out="$(printf '%s' "$NEW" | "$prog" "$@" 2>/dev/null || true)"
-    if printf '%s' "$out" | grep -q '^\$argon2'; then
-      printf '%s' "$out"; return 0
-    fi
+# ---- single hashing method: system argon2 CLI ----
+ensure_argon2(){
+  if command -v argon2 >/dev/null 2>&1; then
+    return 0
   fi
-  return 1
+  # Install once on Alpine-based images (LSIO base) if available
+  if command -v apk >/dev/null 2>&1; then
+    log "argon2 CLI not found; installing via apk..."
+    apk add --no-cache argon2 >/dev/null 2>&1 || {
+      echo "Error: failed to install argon2 (apk). Ensure network access or bake argon2 into the image." >&2
+      exit 1
+    }
+    command -v argon2 >/dev/null 2>&1 || {
+      echo "Error: argon2 CLI still not found after install." >&2
+      exit 1
+    }
+    return 0
+  fi
+  echo "Error: argon2 CLI not found and package manager unavailable." >&2
+  exit 1
 }
 
-make_argon2_hash(){
-  # Prefer npx argon2-cli; fall back to pnpm/yarn via corepack if present
-  if h="$(try_hash_with npx --yes argon2-cli -e)"; then printf '%s' "$h"; return 0; fi
-  if h="$(try_hash_with corepack pnpm dlx argon2-cli -e)"; then printf '%s' "$h"; return 0; fi
-  if h="$(try_hash_with corepack yarn dlx argon2-cli -s -q -y argon2-cli -e)"; then printf '%s' "$h"; return 0; fi
-  echo "Error: could not generate Argon2 hash (need npx or pnpm/yarn via corepack)." >&2
-  return 1
+make_argon2id_hash(){
+  # Uses Argon2id (-id) and emits PHC string with -e
+  # Default params are fine; code-server accepts Argon2 hashes in PHC format.
+  ensure_argon2
+  salt="$(head -c16 /dev/urandom | base64)"
+  printf '%s' "$NEW" | argon2 "$salt" -id -e
 }
 
 trigger_restart_gate(){
@@ -140,7 +149,7 @@ write_hashed_and_restart(){
 
   ensure_dir "$STATE_DIR"
 
-  hash="$(NEW="$NEW" make_argon2_hash)" || exit 1
+  hash="$(NEW="$NEW" make_argon2id_hash)" || exit 1
 
   # Write hash (no trailing newline)
   printf '%s' "$hash" > "$HASH_FILE"

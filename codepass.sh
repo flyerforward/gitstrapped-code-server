@@ -15,7 +15,7 @@ TASKS="$HOME/data/User/tasks.json"
 KEYB="$HOME/data/User/keybindings.json"
 
 install_task(){
-  # Run via /bin/sh so the script doesn't need +x; special chars (!) are safe.
+  # Run via /bin/sh so the script doesn't need +x; special chars like ! are safe.
   TASK_JSON='{
     "label": "Change code-server password",
     "type": "process",
@@ -33,7 +33,9 @@ install_task(){
     "args": "Change code-server password"
   }'
 
-  ensure_dir "$(dirname "$TASKS")"; ensure_dir "$(dirname "$KEYB")"
+  ensure_dir "$(dirname "$TASKS")"
+  ensure_dir "$(dirname "$KEYB")"
+
   if command -v jq >/dev/null 2>&1; then
     tmp="$(mktemp)"
     if [ -f "$TASKS" ] && jq -e . "$TASKS" >/dev/null 2>&1; then
@@ -62,6 +64,7 @@ install_task(){
 JSON
 )" > "$TASKS"
     fi
+
     tmp="$(mktemp)"
     if [ -f "$KEYB" ] && jq -e . "$KEYB" >/dev/null 2>&1; then
       jq --argjson kb "$KB_JSON" '
@@ -85,27 +88,32 @@ JSON
 )" > "$TASKS"
     [ -f "$KEYB" ]  || printf '[%s]\n' "$KB_JSON" > "$KEYB"
   fi
+
   chown "$PUID:$PGID" "$TASKS" "$KEYB" 2>/dev/null || true
   log "installed VS Code task & keybinding"
 }
 
 restart_container(){
   log "requesting supervised shutdown so Docker restarts the container..."
-  # s6-overlay v3 (LinuxServer.io)
-  if command -v s6-svscanctl >/dev/null 2>&1 && [ -d /run/service ]; then
-    s6-svscanctl -t /run/service && exit 0
+  # s6-overlay v3 (LinuxServer.io images)
+  if command -v s6-svscanctl >/dev/null 2>&1; then
+    for dir in /run/service /run/s6/services /run/s6; do
+      if [ -d "$dir" ]; then
+        if s6-svscanctl -t "$dir" 2>/dev/null; then
+          log "signalled s6 supervisor at $dir"
+          exit 0
+        fi
+      fi
+    done
   fi
-  # Legacy/fallback paths
-  for dir in /run/s6/services /run/s6; do
-    if [ -d "$dir" ] && command -v s6-svscanctl >/devnull 2>&1; then
-      s6-svscanctl -t "$dir" && exit 0
-    fi
-  done
-  # Last resort
-  kill -TERM 1 2>/dev/null || {
-    echo "Error: couldn't restart container automatically. Please 'docker restart <container>' once; new password is already saved." >&2
-    exit 1
-  }
+  # Last resort: try to terminate PID 1 (usually root-owned; may fail for non-root users)
+  if kill -TERM 1 2>/dev/null; then
+    log "sent TERM to PID 1"
+    exit 0
+  fi
+
+  echo "Error: couldn't restart container automatically (likely due to permissions). Please 'docker restart <container>' once; the new password is already saved at $PASS_FILE." >&2
+  exit 1
 }
 
 write_password_and_restart(){

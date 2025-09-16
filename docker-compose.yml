@@ -66,33 +66,6 @@ services:
             sleep 2
           done
     restart: always
-    image: curlimages/curl:8.8.0
-    container_name: code-server-restartd
-    depends_on:
-      - code
-    environment:
-      CONTAINER_NAME: "code-server"
-      PASSWORD_FILE: "/config/.gitstrap/codepass.txt"
-      DOCKER_SOCK: "/var/run/docker.sock"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock   # RW so it can call the Docker API
-      - code-config:/config:ro                      # read the same /config volume to watch the password file
-    command: >
-      sh -eu -c '
-        echo "[restartd] watching $PASSWORD_FILE for changes to restart $CONTAINER_NAME";
-        last="";
-        while :; do
-          ts="$(stat -c %Y "$PASSWORD_FILE" 2>/dev/null || true)";
-          if [ -n "$ts" ] && [ "$ts" != "$last" ]; then
-            last="$ts";
-            echo "[restartd] change detected; requesting restart";
-            code="$(curl --unix-socket "$DOCKER_SOCK" -s -o /dev/null -w "%{http_code}" -X POST "http://localhost/v1.41/containers/${CONTAINER_NAME}/restart" || true)";
-            echo "[restartd] docker api returned $code";
-          fi;
-          sleep 2;
-        done'
-    restart: always
-
 volumes:
   code-config:
   projects:

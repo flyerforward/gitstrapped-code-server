@@ -19,7 +19,7 @@ services:
       GIT_BASE_DIR: "/config/workspace"
 
     volumes:
-      - code-config:/config09
+      - code-config:/config093
       - code-config:/config
       - projects:/config/workspace
       - ./settings.json:/config/gitstrap/settings.json:ro

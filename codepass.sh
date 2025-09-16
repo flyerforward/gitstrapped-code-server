@@ -32,9 +32,11 @@ install_task(){
     "args": "Change code-server password"
   }'
 
-  ensure_dir "$(dirname "$TASKS")"; ensure_dir "$(dirname "$KEYB")"
+  ensure_dir "$(dirname "$TASKS")"
+  ensure_dir "$(dirname "$KEYB")"
+
   if command -v jq >/dev/null 2>&1; then
-    # tasks.json upsert
+    # ---- tasks.json upsert
     tmp="$(mktemp)"
     if [ -f "$TASKS" ] && jq -e . "$TASKS" >/dev/null 2>&1; then
       jq --argjson newtask "$TASK_JSON" --argjson newinputs "$INPUTS_JSON" '
@@ -62,7 +64,8 @@ install_task(){
 JSON
 )" > "$TASKS"
     fi
-    # keybindings.json upsert
+
+    # ---- keybindings.json upsert (array)
     tmp="$(mktemp)"
     if [ -f "$KEYB" ] && jq -e . "$KEYB" >/dev/null 2>&1; then
       jq --argjson kb "$KB_JSON" '
@@ -76,6 +79,7 @@ JSON
       printf '[%s]\n' "$KB_JSON" > "$KEYB"
     fi
   else
+    # no jq → create-only (don’t overwrite)
     [ -f "$TASKS" ] || printf '%s\n' "$(cat <<JSON
 {
   "version": "2.0.0",
@@ -86,11 +90,13 @@ JSON
 )" > "$TASKS"
     [ -f "$KEYB" ]  || printf '[%s]\n' "$KB_JSON" > "$KEYB"
   fi
+
   chown "$PUID:$PGID" "$TASKS" "$KEYB" 2>/dev/null || true
   log "installed VS Code task & keybinding"
 }
 
 trigger_restart_hook(){
+  # With network_mode: "service:code" the sidecar listens on 127.0.0.1:9000
   if command -v curl >/dev/null 2>&1; then
     if curl -fsS --max-time 3 "http://127.0.0.1:9000/restart" >/dev/null 2>&1; then
       log "restart sidecar responded at 127.0.0.1:9000/restart"
@@ -99,10 +105,8 @@ trigger_restart_hook(){
     fi
   else
     log "curl not found; please restart the container manually"
-  end
+  fi
 }
-
-
 
 write_password_and_exit_ok(){
   NEW="${1:-}"
@@ -114,6 +118,7 @@ write_password_and_exit_ok(){
   [ ${#NEW} -ge 8 ] || { echo "Error: password must be at least 8 characters." >&2; exit 1; }
 
   ensure_dir "$STATE_DIR"
+
   printf '%s' "$NEW" > "$PASS_FILE"
   chmod 644 "$PASS_FILE" || true
   chown "$PUID:$PGID" "$PASS_FILE" 2>/dev/null || true
@@ -121,7 +126,7 @@ write_password_and_exit_ok(){
 
   ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
   size="$(wc -c < "$PASS_FILE" 2>/dev/null || echo 0)"
-  sum="$(cksum "$PASS_FILE" 2>/dev/null | awk "{print \$1 \"-\" \$2}" || echo "n/a")"
+  sum="$(cksum "$PASS_FILE" 2>/dev/null | awk '{print $1 "-" $2}' || echo "n/a")"
   log "password saved to $PASS_FILE (utc=$ts bytes=$size cksum=$sum)"
   log "container will restart via sidecar and new password will apply at next start"
 

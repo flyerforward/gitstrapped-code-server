@@ -35,11 +35,12 @@ services:
   restartd:
     image: curlimages/curl:8.8.0
     container_name: code-server-restartd
+    user: "0:0"                                  # <— run as root so it can read 600 files
     depends_on:
       - code
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock     # RW so it can call Docker API
-      - code-config:/config:ro                        # read the same /config volume
+      - /var/run/docker.sock:/var/run/docker.sock
+      - code-config:/config:ro
     command:
       - /bin/sh
       - -eu
@@ -48,17 +49,18 @@ services:
           echo "[restartd] watching /config/.gitstrap/codepass.txt for changes to restart code-server"
           last=""
           while :; do
-            cur="$(cat "/config/.gitstrap/codepass.txt" 2>/dev/null || true)"
-            if [ -n "${cur}" ] && [ "${cur}" != "${last}" ]; then
-              last="${cur}"
+            cur="$(cat /config/.gitstrap/codepass.txt 2>/dev/null || true)"
+            if [ -n "$cur" ] && [ "$cur" != "$last" ]; then
+              last="$cur"
               echo "[restartd] change detected; requesting restart of code-server"
-              code="$(curl --unix-socket "/var/run/docker.sock" -s -o /dev/null -w '%{http_code}' \
-                -X POST "http://localhost/v1.41/containers/code-server/restart" || true)"
-              echo "[restartd] docker api returned ${code}"
+              code="$(curl --unix-socket /var/run/docker.sock -s -o /dev/null -w '%{http_code}' \
+                -X POST http://localhost/v1.41/containers/code-server/restart || true)"
+              echo "[restartd] docker api returned $code"
             fi
             sleep 2
           done
     restart: always
+
 volumes:
   code-config:
   projects:

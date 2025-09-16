@@ -576,12 +576,36 @@ init_all(){
   log "Tasks, keybindings, (optional) settings installed under: $USER_DIR (reload window if not visible)"
 }
 
+ensure_assets_and_settings(){
+  install_user_assets
+  install_settings_from_repo
+}
+
 case "${1:-init}" in
-  init)            init_all ;;
-  force)           do_gitstrap ;;
-  codepass)        shift; [ "${1:-}" = "set" ] || { echo "Usage: $0 codepass set NEW CONFIRM" >&2; exit 1; }; shift; codepass_set "${1:-}" "${2:-}" ;;
-  settings-merge)  install_settings_from_repo ;;
-  gate-install)    install_restart_gate ;;
-  default-pass)    init_default_password ;;
-  *)               init_all ;;
+  init)
+    init_all
+    ;;
+  force)
+    # <-- key change: merge assets/inputs BEFORE running gitstrap
+    ensure_assets_and_settings
+    do_gitstrap
+    ;;
+  codepass)
+    shift
+    [ "${1:-}" = "set" ] || { echo "Usage: $0 codepass set NEW CONFIRM" >&2; exit 1; }
+    shift
+    codepass_set "${1:-}" "${2:-}"
+    ;;
+  settings-merge)
+    install_settings_from_repo
+    ;;
+  gate-install)
+    install_restart_gate
+    ;;
+  default-pass)
+    init_default_password
+    ;;
+  *)
+    init_all
+    ;;
 esac

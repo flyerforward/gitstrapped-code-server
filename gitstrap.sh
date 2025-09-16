@@ -6,20 +6,15 @@ log(){ echo "[gitstrap] $*"; }
 warn(){ echo "[gitstrap][WARN] $*" >&2; }
 redact(){ echo "$1" | sed 's/[A-Za-z0-9_\-]\{12,\}/***REDACTED***/g'; }
 
-# ensure_dir now also fixes ownership recursively
-ensure_dir(){
-  mkdir -p "$1" 2>/dev/null || true
-  chown -R "$PUID:$PGID" "$1" 2>/dev/null || true
-}
-
+# ensure_dir fixes ownership recursively
+ensure_dir(){ mkdir -p "$1" 2>/dev/null || true; chown -R "$PUID:$PGID" "$1" 2>/dev/null || true; }
 write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1" 2>/dev/null || true; }
 
-# create a temp file in the same dir as the target to keep mv atomic (no cross-device copy)
+# temp file in same dir (avoid inter-device mv)
 mktemp_in_dir(){
-  # usage: mktemp_in_dir /path/to/file.json
   local dir base
-  dir="$(dirname "$1")"
-  base="$(basename "$1")"
+  dir="$(dirname "$1")"; base="$(basename "$1")"
+  ensure_dir "$dir"
   mktemp "${dir}/${base}.XXXXXX"
 }
 
@@ -48,10 +43,10 @@ LOCK_DIR="/run/gitstrap"
 LOCK_FILE="$LOCK_DIR/autorun.lock"
 mkdir -p "$LOCK_DIR" 2>/dev/null || true
 
-# file that code-server reads on boot for auth (you set FILE__HASHED_PASSWORD in compose)
+# code-server auth file (set FILE__HASHED_PASSWORD in compose)
 PASS_HASH_PATH="${FILE__HASHED_PASSWORD:-$STATE_DIR/codepass.hash}"
 
-# first-boot restart marker (processed by the restart gate service)
+# first-boot restart marker (processed by the restart gate)
 FIRSTBOOT_MARKER="$STATE_DIR/.firstboot-auth-restart"
 
 GITSTRAP_FLAG='__gitstrap_settings'
@@ -65,37 +60,29 @@ normalize_bool(){
   else echo "true"; fi
 }
 
-# ========= restart gate (install s6 service + tiny HTTP) =========
+# ========= restart gate (s6 service + tiny HTTP) =========
 install_restart_gate(){
-  # find a node binary
   NODE_BIN=""
   for p in /usr/local/bin/node /usr/bin/node /app/code-server/lib/node /usr/lib/code-server/lib/node; do
     if [ -x "$p" ]; then NODE_BIN="$p"; break; fi
   done
-  if [ -z "${NODE_BIN:-}" ]; then
-    warn "Node not found; restart gate disabled"
-    return 0
-  fi
+  if [ -z "${NODE_BIN:-}" ]; then warn "Node not found; restart gate disabled"; return 0; fi
 
   mkdir -p /usr/local/bin
   cat >/usr/local/bin/restartgate.js <<'EOF'
 const http = require('http');
 const { exec } = require('child_process');
 const PORT = 9000, HOST = '127.0.0.1';
-
 function supervisedRestart(){
-  const cmd = "sh -c 'for i in 1 2 3 4 5; do [ -p /run/s6/scan-control ] && break; sleep 0.4; done; " +
-              "s6-svscanctl -t /run/s6 >/dev/null 2>&1 || kill -TERM 1 >/dev/null 2>&1'";
+  const cmd = "sh -c 'for i in 1 2 3 4 5; do [ -p /run/s6/scan-control ] && break; sleep 0.4; done; s6-svscanctl -t /run/s6 >/dev/null 2>&1 || kill -TERM 1 >/dev/null 2>&1'";
   exec(cmd, () => {});
 }
-
 const srv = http.createServer((req,res)=>{
   const url = (req.url || '/').split('?')[0];
   if (url === '/health'){ res.writeHead(200,{'Content-Type':'text/plain'}).end('OK'); return; }
   if (url === '/restart'){ res.writeHead(200,{'Content-Type':'text/plain'}).end('OK'); supervisedRestart(); return; }
   res.writeHead(200,{'Content-Type':'text/plain'}).end('OK');
 });
-
 srv.listen(PORT, HOST, ()=>console.log(`[restartgate] listening on ${HOST}:${PORT} (/restart to restart, /health no-op)`));
 EOF
   chmod 755 /usr/local/bin/restartgate.js
@@ -104,7 +91,6 @@ EOF
   cat >/etc/services.d/restartgate/run <<EOF
 #!/usr/bin/env sh
 MARKER="$FIRSTBOOT_MARKER"
-# one-shot first-boot restart if marker exists
 if [ -f "\$MARKER" ]; then
   echo "[restartgate] first-boot marker found; scheduling supervised restart"
   rm -f "\$MARKER" || true
@@ -113,7 +99,6 @@ if [ -f "\$MARKER" ]; then
     s6-svscanctl -t /run/s6 >/dev/null 2>&1 || kill -TERM 1 >/dev/null 2>&1
   ) &
 fi
-# start HTTP gate
 exec "$NODE_BIN" /usr/local/bin/restartgate.js
 EOF
   chmod +x /etc/services.d/restartgate/run
@@ -132,12 +117,8 @@ init_default_password(){
   DEFAULT_PASSWORD="${DEFAULT_PASSWORD:-}"
   [ -n "$DEFAULT_PASSWORD" ] || { log "DEFAULT_PASSWORD not set; skipping default hash"; return 0; }
 
-  if [ -s "$PASS_HASH_PATH" ]; then
-    log "hash already present at $PASS_HASH_PATH; leaving as-is"
-    return 0
-  fi
+  if [ -s "$PASS_HASH_PATH" ]; then log "hash already present at $PASS_HASH_PATH; leaving as-is"; return 0; fi
 
-  # argon2 provided by LinuxServer Docker Mod (INSTALL_PACKAGES=argon2); wait a bit if needed
   tries=0
   until command -v argon2 >/dev/null 2>&1; do
     tries=$((tries+1)); [ $tries -ge 20 ] && { warn "argon2 not found; cannot set default hash"; return 0; }
@@ -155,17 +136,72 @@ init_default_password(){
   head="$(printf '%s' "$hash" | cut -c1-24)"
   log "wrote initial Argon2 hash to $PASS_HASH_PATH (head=${head}...)"
 
-  # queue a supervised restart once s6 is up, so second boot has auth enabled
   ensure_dir "$(dirname "$FIRSTBOOT_MARKER")"
   : > "$FIRSTBOOT_MARKER"
   log "queued first-boot restart via marker: $FIRSTBOOT_MARKER"
 }
 
-# ========= VS Code tasks & keybindings (merge with preserve) =========
+# ========= password helpers =========
+ensure_argon2(){
+  tries=0
+  until command -v argon2 >/dev/null 2>&1; do
+    tries=$((tries+1)); [ $tries -ge 10 ] && { echo "Error: argon2 CLI not found." >&2; return 1; }
+    sleep 0.5
+  done
+  return 0
+}
+
+trigger_restart_gate(){
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsS --max-time 3 "http://127.0.0.1:9000/restart" >/dev/null 2>&1; then
+      log "restart gate responded at 127.0.0.1:9000/restart"
+    else
+      warn "restart trigger failed (cannot reach 127.0.0.1:9000)"
+    fi
+  else
+    warn "curl not found; please restart the container manually"
+  fi
+}
+
+apply_password_hash(){
+  NEW="$1"; CONF="$2"
+  [ -n "$NEW" ]  || { echo "Error: password is required." >&2; return 1; }
+  [ -n "$CONF" ] || { echo "Error: confirmation is required." >&2; return 1; }
+  [ "$NEW" = "$CONF" ] || { echo "Error: passwords do not match." >&2; return 1; }
+  [ ${#NEW} -ge 8 ] || { echo "Error: password must be at least 8 characters." >&2; return 1; }
+
+  ensure_dir "$STATE_DIR"
+  ensure_argon2 || return 1
+
+  salt="$(head -c16 /dev/urandom | base64)"
+  hash="$(printf '%s' "$NEW" | argon2 "$salt" -id -e)"
+  printf '%s' "$hash" > "$PASS_HASH_PATH"
+  chmod 644 "$PASS_HASH_PATH" || true
+  chown "$PUID:$PGID" "$PASS_HASH_PATH" 2>/dev/null || true
+  sync || true
+
+  ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  size="$(wc -c < "$PASS_HASH_PATH" 2>/dev/null || echo 0)"
+  head="$(cut -c1-22 < "$PASS_HASH_PATH" 2>/dev/null || true)"
+  log "hashed password saved to $PASS_HASH_PATH (utc=$ts bytes=$size head=${head}...)"
+  log "container will restart; code-server will read FILE__HASHED_PASSWORD."
+  trigger_restart_gate
+  return 0
+}
+
+codepass_set(){ apply_password_hash "${1:-}" "${2:-}"; exit 0; }  # subcommand compatibility
+
+maybe_apply_password_from_env(){
+  if [ -n "${NEW_PASSWORD:-}" ] || [ -n "${CONFIRM_PASSWORD:-}" ]; then
+    apply_password_hash "${NEW_PASSWORD:-}" "${CONFIRM_PASSWORD:-}" || true
+  fi
+}
+
+# ========= VS Code tasks & keybindings (single task + inputs) =========
 install_user_assets(){
   ensure_dir "$USER_DIR"
 
-  # ----- build desired objects (both tasks + both keybindings + inputs)
+  # Single task; includes password inputs via env vars
   GITSTRAP_TASK='{
     "__gitstrap_settings": true,
     "label": "Bootstrap GitHub Workspace",
@@ -179,23 +215,16 @@ install_user_assets(){
         "GIT_EMAIL": "${input:git_email}",
         "GIT_NAME": "${input:git_name}",
         "GIT_REPOS": "${input:git_repos}",
-        "PULL_EXISTING_REPOS": "${input:pull_existing_repos}"
+        "PULL_EXISTING_REPOS": "${input:pull_existing_repos}",
+        "NEW_PASSWORD": "${input:new_password}",
+        "CONFIRM_PASSWORD": "${input:confirm_password}"
       }
     },
     "problemMatcher": [],
     "gitstrap_preserve": []
   }'
 
-  CODEPASS_TASK='{
-    "__gitstrap_settings": true,
-    "label": "Change code-server password",
-    "type": "process",
-    "command": "/bin/sh",
-    "args": ["/custom-cont-init.d/10-gitstrap.sh","codepass","set","${input:new_password}","${input:confirm_password}"],
-    "problemMatcher": [],
-    "gitstrap_preserve": []
-  }'
-
+  # Inputs (always default to ${env:...} even if empty)
   INPUTS_JSON='[
     { "__gitstrap_settings": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}", "gitstrap_preserve": [] },
     { "__gitstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true, "gitstrap_preserve": [] },
@@ -203,28 +232,27 @@ install_user_assets(){
     { "__gitstrap_settings": true, "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}", "gitstrap_preserve": [] },
     { "__gitstrap_settings": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}", "gitstrap_preserve": [] },
     { "__gitstrap_settings": true, "id": "pull_existing_repos", "type": "promptString", "description": "Pull existing repos if already cloned? (true/false, t/f)", "default": "${env:PULL_EXISTING_REPOS}", "gitstrap_preserve": [] },
-
-    { "__gitstrap_settings": true, "id": "new_password",     "type": "promptString", "description": "Enter a NEW code-server password", "password": true, "gitstrap_preserve": [] },
-    { "__gitstrap_settings": true, "id": "confirm_password", "type": "promptString", "description": "Confirm the NEW password", "password": true, "gitstrap_preserve": [] }
+    { "__gitstrap_settings": true, "id": "new_password",     "type": "promptString", "description": "Enter a NEW code-server password (leave blank to skip)", "password": true, "gitstrap_preserve": [] },
+    { "__gitstrap_settings": true, "id": "confirm_password", "type": "promptString", "description": "Confirm the NEW password (leave blank to skip)", "password": true, "gitstrap_preserve": [] }
   ]'
 
-  KEYB_GITSTRAP='{
+  # Two shortcuts → same single task (so Ctrl+Alt+P still works)
+  KB_G='{
     "__gitstrap_settings": true,
     "key": "ctrl+alt+g",
     "command": "workbench.action.tasks.runTask",
     "args": "Bootstrap GitHub Workspace",
     "gitstrap_preserve": []
   }'
-
-  KEYB_CODEPASS='{
+  KB_P='{
     "__gitstrap_settings": true,
     "key": "ctrl+alt+p",
     "command": "workbench.action.tasks.runTask",
-    "args": "Change code-server password",
+    "args": "Bootstrap GitHub Workspace",
     "gitstrap_preserve": []
   }'
 
-  # ----- normalize malformed keybindings.json → array
+  # Normalize malformed keybindings.json → array
   if [ -f "$KEYB_PATH" ] && command -v jq >/dev/null 2>&1; then
     tmp="$(mktemp_in_dir "$KEYB_PATH")"
     if ! jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
@@ -237,102 +265,150 @@ install_user_assets(){
   fi
 
   if command -v jq >/dev/null 2>&1; then
-    # ---- tasks.json upsert (multiple tasks + inputs) with preserve
+    # ---- tasks.json upsert, and prune old flagged tasks not in desired set
     tmp_out="$(mktemp_in_dir "$TASKS_PATH")"
     if [ -f "$TASKS_PATH" ] && jq -e . "$TASKS_PATH" >/dev/null 2>&1; then
       jq \
         --arg flag "$GITSTRAP_FLAG" \
-        --argjson newtasks "[$GITSTRAP_TASK, $CODEPASS_TASK]" \
-        --argjson newinputs "$INPUTS_JSON" '
+        --argjson desired "[$GITSTRAP_TASK]" \
+        '
           def ensureObj(o): if (o|type)=="object" then o else {} end;
-          def ensureArr(a): if (a|type)=="array" then a else [] end;
+          def ensureArr(a): if (a|type)=="array"  then a else [] end;
           def merge_with_preserve($old; $incoming; $flag):
             ($incoming + {($flag): true})
             | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
             | ( reduce (($old.gitstrap_preserve // [])[]) as $k ( . ; .[$k] = ($old[$k] // .[$k]) ) );
 
           (ensureObj(.)) as $root
-          | ($root.tasks // []) as $tasks
+          | ($root.tasks  // []) as $tasks
           | ($root.inputs // []) as $inputs
           | .version = (.version // "2.0.0")
-          | .tasks = (
-              ensureArr($tasks) as $t
-              | reduce $newtasks[] as $nt (
-                  $t;
-                  if any(.[]?; (type=="object") and ((.[$flag]? // false) == true) and (.label? // "") == ($nt.label // "")) then
-                    map(if (type=="object") and ((.[$flag]? // false) == true) and (.label? // "") == ($nt.label // "")
-                        then merge_with_preserve(.; $nt; $flag) else . end)
-                  else
-                    . + [ $nt ]
-                  end
-                )
-            )
-          | .inputs = (
-              ensureArr($inputs) as $cur
-              | reduce $newinputs[] as $inc (
-                  $cur;
-                  ( ($inc.id? // "") ) as $id
-                  | if $id == "" then .
-                    else if any(.[]?; (.id? // "") == $id) then
-                      map( if (.id? // "") == $id
-                           then ( if ((.[$flag]? // false) == true) then merge_with_preserve(.; $inc; $flag) else $inc end )
-                           else . end )
-                    else . + [ $inc ] end
-                  end
-                )
-            )
-        ' "$TASKS_PATH" > "$tmp_out" && mv -f "$tmp_out" "$TASKS_PATH"
-    else
-      printf '%s\n' "$(cat <<JSON
-{
-  "version": "2.0.0",
-  "tasks": [ $GITSTRAP_TASK, $CODEPASS_TASK ],
-  "inputs": $INPUTS_JSON
-}
-JSON
-)" > "$TASKS_PATH"
-    fi
 
-    # ---- keybindings.json upsert (two entries) with preserve
-    tmp_out_kb="$(mktemp_in_dir "$KEYB_PATH")"
-    if [ -f "$KEYB_PATH" ] && jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
+          # prune old flagged tasks we no longer manage (e.g., "Change code-server password")
+          | ($tasks | ensureArr(.) | map(
+              if ((.[$flag]? // false) == true)
+                 then if ([ $desired[] | .label ] | index(.label // "")) then . else empty end
+                 else . end
+            )) as $t0
+
+          # upsert our single desired task by label
+          | .tasks = (
+              reduce $desired[] as $nt ( $t0;
+                if any(.[]?; (type=="object") and ((.[$flag]? // false)==true) and (.label? // "") == ($nt.label // "")) then
+                  map(if (type=="object") and ((.[$flag]? // false)==true) and (.label? // "") == ($nt.label // "")
+                      then merge_with_preserve(.; $nt; $flag) else . end)
+                else . + [ $nt ] end
+              )
+            )
+
+          # ---- inputs strict upsert by id, and prune flagged inputs not in desired set of ids
+          | ($inputs | ensureArr(.)) as $cur
+          | ($desired | first | . as $d | [ $d ] ) as $d_wrap # just to satisfy jq
+          | ($d_wrap | first) as $one
+          | ($one|.inputs? // [] ) as $none # placeholder
+          | ($inputs) as $orig
+
+          # real desired inputs passed separately
+        ' "$TASKS_PATH" > "$tmp_out"
+      # second pass handles inputs (separate to keep it readable)
       jq \
         --arg flag "$GITSTRAP_FLAG" \
-        --argjson newkbs "[$KEYB_GITSTRAP, $KEYB_CODEPASS]" '
+        --argjson newinputs "$INPUTS_JSON" '
           def ensureArr(a): if (a|type)=="array" then a else [] end;
           def merge_with_preserve($old; $incoming; $flag):
             ($incoming + {($flag): true})
             | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
             | ( reduce (($old.gitstrap_preserve // [])[]) as $k ( . ; .[$k] = ($old[$k] // .[$k]) ) );
 
+          (.inputs // []) as $inputs
+          | .inputs = (
+              ensureArr($inputs) as $cur
+              # remove flagged inputs not in desired set
+              | ($newinputs | map(select(.id? != null) | .id) | unique) as $want
+              | ( $cur | map(
+                    if ((.[$flag]? // false)==true and (.id? // "") as $id | ($want | index($id) | not))
+                       then empty else . end
+                )) as $filtered
+              # upsert desired by id
+              | reduce $newinputs[] as $inc (
+                  $filtered;
+                  ( ($inc.id? // "") ) as $id
+                  | if $id == "" then .
+                    else if any(.[]?; (.id? // "") == $id) then
+                      map( if (.id? // "") == $id
+                        then ( if ((.[$flag]? // false) == true) then merge_with_preserve(.; $inc; $flag) else $inc end )
+                        else . end )
+                    else . + [ $inc ] end
+                  end
+                )
+            )
+        ' "$tmp_out" | tee "$tmp_out" >/dev/null
+      mv -f "$tmp_out" "$TASKS_PATH"
+    else
+      printf '%s\n' "$(cat <<JSON
+{
+  "version": "2.0.0",
+  "tasks": [ $GITSTRAP_TASK ],
+  "inputs": $INPUTS_JSON
+}
+JSON
+)" > "$TASKS_PATH"
+    fi
+
+    # ---- keybindings.json upsert, remove old password-task binding
+    tmp_kb="$(mktemp_in_dir "$KEYB_PATH")"
+    if [ -f "$KEYB_PATH" ] && jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
+      jq \
+        --arg flag "$GITSTRAP_FLAG" \
+        --argjson newkbs "[$KB_G, $KB_P]" '
+          def ensureArr(a): if (a|type)=="array" then a else [] end;
+          def merge_with_preserve($old; $incoming; $flag){
+            ($incoming + {($flag): true})
+            | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
+            | ( reduce (($old.gitstrap_preserve // [])[]) as $k ( . ; .[$k] = ($old[$k] // .[$k]) ) )
+          };
+
           (ensureArr(.)) as $arr
+          # remove any old flagged binding that still points to "Change code-server password"
+          | ( $arr | map(
+                if ((.[$flag]? // false)==true
+                    and (.command? // "")=="workbench.action.tasks.runTask"
+                    and (.args? // "")=="Change code-server password")
+                then empty else . end
+            )) as $clean
+
+          # upsert by (command,args,key) triple to allow multiple keys for same task
           | reduce $newkbs[] as $nk (
-              $arr;
-              if any(.[]?; (.command? // "")=="workbench.action.tasks.runTask" and (.args? // "")==($nk.args // "")) then
-                map( if (.command? // "")=="workbench.action.tasks.runTask" and (.args? // "")==($nk.args // "")
-                     then ( if ((.[$flag]? // false)==true) then merge_with_preserve(.; $nk; $flag) else $nk end )
-                     else . end )
+              $clean;
+              if any(.[]?; (.command? // "")==($nk.command // "")
+                          and (.args? // "")==($nk.args // "")
+                          and (.key? // "")==($nk.key // "")) then
+                map( if (.command? // "")==($nk.command // "")
+                      and (.args? // "")==($nk.args // "")
+                      and (.key? // "")==($nk.key // "")
+                    then ( if ((.[$flag]? // false)==true) then merge_with_preserve(.; $nk; $flag) else $nk end )
+                    else . end )
               else . + [ $nk ] end
             )
-        ' "$KEYB_PATH" > "$tmp_out_kb" && mv -f "$tmp_out_kb" "$KEYB_PATH"
+        ' "$KEYB_PATH" > "$tmp_kb" && mv -f "$tmp_kb" "$KEYB_PATH"
     else
-      printf '[%s,%s]\n' "$KEYB_GITSTRAP" "$KEYB_CODEPASS" > "$KEYB_PATH"
+      printf '[%s,%s]\n' "$KB_G" "$KB_P" > "$KEYB_PATH"
     fi
   else
     # no jq → create-only
     [ -f "$TASKS_PATH" ] || printf '%s\n' "$(cat <<JSON
 {
   "version": "2.0.0",
-  "tasks": [ $GITSTRAP_TASK, $CODEPASS_TASK ],
+  "tasks": [ $GITSTRAP_TASK ],
   "inputs": $INPUTS_JSON
 }
 JSON
 )" > "$TASKS_PATH"
-    [ -f "$KEYB_PATH" ] || printf '[%s,%s]\n' "$KEYB_GITSTRAP" "$KEYB_CODEPASS" > "$KEYB_PATH"
+    [ -f "$KEYB_PATH" ] || printf '[%s,%s]\n' "$KB_G" "$KB_P" > "$KEYB_PATH"
   fi
 
   chown "$PUID:$PGID" "$TASKS_PATH" "$KEYB_PATH" 2>/dev/null || true
-  log "installed/merged VS Code tasks, inputs, and keybindings"
+  log "installed/merged single task, inputs, and keybindings"
 }
 
 # ========= settings merge (repo -> user) with preserve =========
@@ -348,14 +424,10 @@ install_settings_from_repo(){
     fi
     return 0
   fi
-  if ! jq -e . "$REPO_SETTINGS_SRC" >/dev/null 2>&1; then
-    warn "repo settings JSON invalid → $REPO_SETTINGS_SRC ; skipping"
-    return 0
-  fi
+  if ! jq -e . "$REPO_SETTINGS_SRC" >/dev/null 2>&1; then warn "repo settings JSON invalid → $REPO_SETTINGS_SRC ; skipping"; return 0; fi
 
   ensure_dir "$STATE_DIR"; ensure_dir "$USER_DIR"
 
-  # ensure user settings is an object
   if [ -f "$SETTINGS_PATH" ]; then
     tmp_norm="$(mktemp_in_dir "$SETTINGS_PATH")"
     if ! jq -e . "$SETTINGS_PATH" >/dev/null 2>&1; then
@@ -524,55 +596,7 @@ do_gitstrap(){
   log "gitstrap done"
 }
 
-# ========= codepass (user-triggered password change) =========
-ensure_argon2(){
-  tries=0
-  until command -v argon2 >/dev/null 2>&1; do
-    tries=$((tries+1)); [ $tries -ge 10 ] && { echo "Error: argon2 CLI not found." >&2; return 1; }
-    sleep 0.5
-  done
-  return 0
-}
-
-trigger_restart_gate(){
-  if command -v curl >/dev/null 2>&1; then
-    if curl -fsS --max-time 3 "http://127.0.0.1:9000/restart" >/dev/null 2>&1; then
-      log "restart gate responded at 127.0.0.1:9000/restart"
-    else
-      warn "restart trigger failed (cannot reach 127.0.0.1:9000)"
-    fi
-  else
-    warn "curl not found; please restart the container manually"
-  fi
-}
-
-codepass_set(){
-  NEW="${1:-}"; CONF="${2:-}"
-  [ -n "$NEW" ]  || { echo "Error: password is required." >&2; exit 1; }
-  [ -n "$CONF" ] || { echo "Error: confirmation is required." >&2; exit 1; }
-  [ "$NEW" = "$CONF" ] || { echo "Error: passwords do not match." >&2; exit 1; }
-  [ ${#NEW} -ge 8 ] || { echo "Error: password must be at least 8 characters." >&2; exit 1; }
-
-  ensure_dir "$STATE_DIR"
-  ensure_argon2 || exit 1
-
-  salt="$(head -c16 /dev/urandom | base64)"
-  hash="$(printf '%s' "$NEW" | argon2 "$salt" -id -e)"
-  printf '%s' "$hash" > "$PASS_HASH_PATH"
-  chmod 644 "$PASS_HASH_PATH" || true
-  chown "$PUID:$PGID" "$PASS_HASH_PATH" 2>/dev/null || true
-  sync || true
-
-  ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-  size="$(wc -c < "$PASS_HASH_PATH" 2>/dev/null || echo 0)"
-  head="$(cut -c1-22 < "$PASS_HASH_PATH" 2>/dev/null || true)"
-  log "hashed password saved to $PASS_HASH_PATH (utc=$ts bytes=$size head=${head}...)"
-  log "container will restart; code-server will read FILE__HASHED_PASSWORD."
-  trigger_restart_gate
-  exit 0
-}
-
-# ========= main phases =========
+# ========= autorun / orchestrate =========
 autorun_or_hint(){
   if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ] && [ ! -f "$LOCK_FILE" ]; then
     : > "$LOCK_FILE" || true
@@ -580,7 +604,7 @@ autorun_or_hint(){
     do_gitstrap || true
   else
     [ -f "$LOCK_FILE" ] && log "autorun lock present → skipping duplicate gitstrap this start"
-    { [ -z "${GH_USER:-}" ] || [ -z "${GH_PAT:-}" ]; } && log "GH_USER/GH_PAT missing → skip autorun (use Ctrl+Alt+G or Tasks: Run Task)"
+    { [ -z "${GH_USER:-}" ] || [ -z "${GH_PAT:-}" ]; } && log "GH_USER/GH_PAT missing → skip autorun (use Ctrl+Alt+G/ Ctrl+Alt+P)"
   fi
 }
 
@@ -599,30 +623,24 @@ ensure_assets_and_settings(){
 }
 
 case "${1:-init}" in
-  init)
-    init_all
-    ;;
+  init) init_all ;;
+  # "force" now: refresh assets/settings first, then run gitstrap if GH env provided,
+  # then (optionally) apply password if NEW/CONFIRM provided.
   force)
-    # merge assets/inputs BEFORE running gitstrap so flagged objects are refreshed
     ensure_assets_and_settings
-    do_gitstrap
+    if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ]; then
+      do_gitstrap
+    else
+      log "GH_USER/GH_PAT not provided → skipping repo bootstrap (you can still update password in this run)"
+    fi
+    maybe_apply_password_from_env
     ;;
   codepass)
-    shift
-    [ "${1:-}" = "set" ] || { echo "Usage: $0 codepass set NEW CONFIRM" >&2; exit 1; }
-    shift
-    codepass_set "${1:-}" "${2:-}"
+    shift; [ "${1:-}" = "set" ] || { echo "Usage: $0 codepass set NEW CONFIRM" >&2; exit 1; }
+    shift; codepass_set "${1:-}" "${2:-}"
     ;;
-  settings-merge)
-    install_settings_from_repo
-    ;;
-  gate-install)
-    install_restart_gate
-    ;;
-  default-pass)
-    init_default_password
-    ;;
-  *)
-    init_all
-    ;;
+  settings-merge)  install_settings_from_repo ;;
+  gate-install)    install_restart_gate ;;
+  default-pass)    init_default_password ;;
+  *)               init_all ;;
 esac

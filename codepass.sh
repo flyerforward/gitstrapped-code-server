@@ -106,15 +106,25 @@ write_password_and_exit_ok(){
   [ ${#NEW} -ge 8 ] || { echo "Error: password must be at least 8 characters." >&2; exit 1; }
 
   ensure_dir "$STATE_DIR"
+
+  # Write new password and make it world-readable so the sidecar can read it
+  # (world-readability is OK here; the file lives in a private Docker volume)
   printf '%s' "$NEW" > "$PASS_FILE"
   chmod 644 "$PASS_FILE" || true
   chown "$PUID:$PGID" "$PASS_FILE" 2>/dev/null || true
+  sync || true
 
-  log "password saved to $PASS_FILE"
+  # Log some proof for you in the task terminal
+  ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  size="$(wc -c < "$PASS_FILE" 2>/dev/null || echo 0)"
+  sum="$(cksum "$PASS_FILE" 2>/dev/null | awk '{print $1 "-" $2}' || echo "n/a")"
+  log "password saved to $PASS_FILE (utc=$ts bytes=$size cksum=$sum)"
   log "sidecar will detect the change and restart the container shortly"
-  # IMPORTANT: exit 0 so the VS Code task shows as successful
+
+  # IMPORTANT: exit 0 so the VS Code task shows success
   exit 0
 }
+
 
 case "${1:-init}" in
   init) install_task ;;

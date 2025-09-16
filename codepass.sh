@@ -89,6 +89,25 @@ JSON
   log "installed VS Code task & keybinding"
 }
 
+restart_container(){
+  log "requesting supervised shutdown so Docker restarts the container..."
+  # s6-overlay v3 (LinuxServer.io)
+  if command -v s6-svscanctl >/dev/null 2>&1 && [ -d /run/service ]; then
+    s6-svscanctl -t /run/service && exit 0
+  fi
+  # Legacy/fallback paths
+  for dir in /run/s6/services /run/s6; do
+    if [ -d "$dir" ] && command -v s6-svscanctl >/devnull 2>&1; then
+      s6-svscanctl -t "$dir" && exit 0
+    fi
+  done
+  # Last resort
+  kill -TERM 1 2>/dev/null || {
+    echo "Error: couldn't restart container automatically. Please 'docker restart <container>' once; new password is already saved." >&2
+    exit 1
+  }
+}
+
 write_password_and_restart(){
   NEW="$1"; CONF="$2"
   [ -n "$NEW" ]  || { echo "Error: password is required." >&2; exit 1; }
@@ -102,15 +121,7 @@ write_password_and_restart(){
   chown "$PUID:$PGID" "$PASS_FILE" 2>/dev/null || true
   log "wrote new password to $PASS_FILE (used via FILE__PASSWORD at boot)"
 
-  # *** Self-restart the container (s6 overlay): this exits PID 1 cleanly. ***
-  # With restart: always, Docker brings it back and the env FILE__PASSWORD is re-read.
-  log "requesting supervised shutdown so Docker restarts the container..."
-  if command -v s6-svscanctl >/dev/null 2>&1; then
-    s6-svscanctl -t /run/s6 || true
-  else
-    # Fallback: kill pid 1 (s6). Docker will restart the container.
-    kill -TERM 1 || true
-  fi
+  restart_container
 }
 
 case "${1:-init}" in

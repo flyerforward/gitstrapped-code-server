@@ -91,12 +91,11 @@ JSON
 }
 
 trigger_restart_hook(){
-  # Notify the sidecar over HTTP to restart this container
   if command -v curl >/dev/null 2>&1; then
-    curl -fsS --max-time 2 http://code-server-restartd:9000/ >/dev/null 2>&1 || true
-    log "sent restart trigger to sidecar (http://code-server-restartd:9000/)"
+    curl -fsS --max-time 2 http://code-server-restartd:9000/cgi-bin/restart >/dev/null 2>&1 || true
+    log "sent restart trigger to sidecar (GET /cgi-bin/restart)"
   else
-    log "curl not found; restart sidecar cannot be triggered (please restart container manually)"
+    log "curl not found; please restart the container manually"
   fi
 }
 

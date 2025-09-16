@@ -12,45 +12,23 @@ export HOME="${HOME:-/config}"
 CONFIG_DIR="$HOME/.config/code-server"
 CONFIG="$CONFIG_DIR/config.yaml"
 STATE_DIR="$HOME/.gitstrap"
-PASS_STORE="$STATE_DIR/codepass.hash"
 
 TASKS="$HOME/data/User/tasks.json"
 KEYB="$HOME/data/User/keybindings.json"
 
-# --- hash & apply to config.yaml ---
-apply_hash_to_config(){
-  hash="$1"
-  ensure_dir "$CONFIG_DIR"
-
-  # Backup (best-effort)
-  [ -f "$CONFIG" ] && cp "$CONFIG" "$CONFIG.bak.$(date +%s)" || :
-
-  tmp="$(mktemp)"
-  if [ -f "$CONFIG" ]; then
-    # drop previous auth/password lines
-    grep -vE '^[[:space:]]*(auth|password|hashed-password)[[:space:]]*:' "$CONFIG" > "$tmp" || true
-  else
-    : > "$tmp"
-  fi
-  {
-    echo
-    echo "auth: password"
-    printf 'hashed-password: "%s"\n' "$hash"
-  } >> "$tmp"
-
-  mv "$tmp" "$CONFIG"
-  chown "$PUID:$PGID" "$CONFIG" 2>/dev/null || true
-  log "updated $CONFIG with new hashed password"
+yaml_quote() {
+  # minimal YAML-safe double-quoted string
+  # escape backslashes and double quotes
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
-# --- create or upsert the VS Code Task & inputs ---
 install_task(){
-  # Task definition
+  # Run as a *process* (no shell), so special chars like ! are safe.
   TASK_JSON='{
     "label": "Change code-server password",
-    "type": "shell",
-    "command": "sh",
-    "args": ["/custom-cont-init.d/20-codepass.sh","set","${input:new_password}","${input:confirm_password}"],
+    "type": "process",
+    "command": "/custom-cont-init.d/20-codepass.sh",
+    "args": ["set", "${input:new_password}", "${input:confirm_password}"],
     "problemMatcher": []
   }'
 
@@ -70,7 +48,6 @@ install_task(){
   ensure_dir "$(dirname "$KEYB")"
 
   if command -v jq >/dev/null 2>&1; then
-    # tasks.json upsert by label
     tmp="$(mktemp)"
     if [ -f "$TASKS" ] && jq -e . "$TASKS" >/dev/null 2>&1; then
       jq \
@@ -107,7 +84,6 @@ JSON
 )" > "$TASKS"
     fi
 
-    # keybindings.json upsert (array)
     tmp="$(mktemp)"
     if [ -f "$KEYB" ] && jq -e . "$KEYB" >/dev/null 2>&1; then
       jq \
@@ -126,7 +102,6 @@ JSON
       printf '[%s]\n' "$KB_JSON" > "$KEYB"
     fi
   else
-    # no jq → create-only (don’t overwrite)
     [ -f "$TASKS" ] || printf '%s\n' "$(cat <<JSON
 {
   "version": "2.0.0",
@@ -142,59 +117,57 @@ JSON
   log "installed VS Code task & keybinding"
 }
 
-# --- set new password flow (called by the task) ---
+apply_plain_password(){
+  NEW="$1"
+  ensure_dir "$CONFIG_DIR"
+  # Backup if present
+  [ -f "$CONFIG" ] && cp "$CONFIG" "$CONFIG.bak.$(date +%s)" || :
+
+  tmp="$(mktemp)"
+  if [ -f "$CONFIG" ]; then
+    # remove any previous auth/password/hashed-password lines
+    grep -vE '^[[:space:]]*(auth|password|hashed-password)[[:space:]]*:' "$CONFIG" > "$tmp" || true
+  else
+    : > "$tmp"
+  fi
+  esc="$(yaml_quote "$NEW")"
+  {
+    echo
+    echo "auth: password"
+    printf 'password: "%s"\n' "$esc"
+  } >> "$tmp"
+
+  mv "$tmp" "$CONFIG"
+  chown "$PUID:$PGID" "$CONFIG" 2>/dev/null || true
+  log "updated $CONFIG with new *plain* password"
+}
+
+restart_codeserver(){
+  # Kill the server; s6 will bring it back.
+  pkill -f "/app/code-server" 2>/dev/null || \
+  pkill -f "node.*code-server" 2>/dev/null || true
+  log "code-server restarting with new password…"
+}
+
 cmd_set(){
   NEW="${1:-}"
   CONF="${2:-}"
 
-  if [ -z "$NEW" ] || [ -z "$CONF" ]; then
-    echo "Error: password and confirmation are required." >&2
-    exit 1
-  fi
-  if [ "$NEW" != "$CONF" ]; then
-    echo "Error: passwords do not match." >&2
-    exit 1
-  fi
-  if [ ${#NEW} -lt 8 ]; then
-    echo "Error: password must be at least 8 characters." >&2
-    exit 1
-  fi
-
-  if ! command -v code-server >/dev/null 2>&1; then
-    echo "Error: code-server CLI not found in container." >&2
-    exit 1
-  fi
-
-  HASH="$(code-server hash-password "$NEW" 2>/dev/null | tail -n1)"
-  case "$HASH" in ""|*" "*)
-    echo "Error: failed to hash password." >&2
-    exit 1
-  esac
+  [ -n "$NEW" ] || { echo "Error: password is required." >&2; exit 1; }
+  [ -n "$CONF" ] || { echo "Error: confirmation is required." >&2; exit 1; }
+  [ "$NEW" = "$CONF" ] || { echo "Error: passwords do not match." >&2; exit 1; }
+  [ ${#NEW} -ge 8 ] || { echo "Error: password must be at least 8 characters." >&2; exit 1; }
 
   ensure_dir "$STATE_DIR"
-  printf '%s' "$HASH" > "$PASS_STORE"
-  chmod 600 "$PASS_STORE" || true
-  chown "$PUID:$PGID" "$PASS_STORE" 2>/dev/null || true
+  printf '%s' "$NEW" > "$STATE_DIR/codepass.plain"
+  chmod 600 "$STATE_DIR/codepass.plain" || true
+  chown "$PUID:$PGID" "$STATE_DIR/codepass.plain" 2>/dev/null || true
 
-  apply_hash_to_config "$HASH"
-
-  # restart only the code-server process; s6 will bring it back
-  pkill -f "code-server.*--bind-addr" || true
-  log "code-server restarting with new password…"
+  apply_plain_password "$NEW"
+  restart_codeserver
 }
 
-# --- optional: apply saved hash at boot (best-effort) ---
-cmd_apply_on_boot(){
-  if [ -s "$PASS_STORE" ]; then
-    HASH="$(cat "$PASS_STORE")"
-    apply_hash_to_config "$HASH"
-  fi
-}
-
-# -------- main --------
 case "${1:-init}" in
-  set)             shift; cmd_set "$@";;
-  apply-on-boot)   cmd_apply_on_boot;;
-  init)            install_task; cmd_apply_on_boot;;
-  *)               install_task; cmd_apply_on_boot;;
+  set) shift; cmd_set "$@";;
+  init|*) install_task;;
 esac

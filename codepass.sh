@@ -9,7 +9,7 @@ PGID="${PGID:-1000}"
 export HOME="${HOME:-/config}"
 
 STATE_DIR="$HOME/.gitstrap"
-HASH_FILE="$STATE_DIR/codepass.hash"          # <-- hashed password goes here
+HASH_FILE="$STATE_DIR/codepass.hash"   # <-- hashed password file (used via FILE__HASHED_PASSWORD)
 
 TASKS="$HOME/data/User/tasks.json"
 KEYB="$HOME/data/User/keybindings.json"
@@ -36,7 +36,7 @@ install_task(){
   ensure_dir "$(dirname "$KEYB")"
 
   if command -v jq >/dev/null 2>&1; then
-    # tasks.json upsert
+    # ---- tasks.json upsert
     tmp="$(mktemp)"
     if [ -f "$TASKS" ] && jq -e . "$TASKS" >/dev/null 2>&1; then
       jq --argjson newtask "$TASK_JSON" --argjson newinputs "$INPUTS_JSON" '
@@ -65,21 +65,24 @@ JSON
 )" > "$TASKS"
     fi
 
-    # keybindings.json upsert (array)
+    # ---- keybindings.json upsert (ensure array; replace/append by command+args)
     tmp="$(mktemp)"
     if [ -f "$KEYB" ] && jq -e . "$KEYB" >/dev/null 2>&1; then
       jq --argjson kb "$KB_JSON" '
-        if type=="array"
-        then if any(.[]?; (.command? // "")=="workbench.action.tasks.runTask" && (.args? // "")=="Change code-server password")
-             then map(if (.command? // "")=="workbench.action.tasks.runTask" && (.args? // "")=="Change code-server password" then $kb else . end)
-             else . + [ $kb ] end
+        if type=="array" then
+          if any(.[]?; (.command? // "")=="workbench.action.tasks.runTask" and (.args? // "")=="Change code-server password")
+          then map(
+                 if   (.command? // "")=="workbench.action.tasks.runTask" and (.args? // "")=="Change code-server password"
+                 then $kb else . end
+               )
+          else . + [ $kb ] end
         else [ $kb ] end
       ' "$KEYB" > "$tmp" && mv "$tmp" "$KEYB"
     else
       printf '[%s]\n' "$KB_JSON" > "$KEYB"
     fi
   else
-    # no jq → create-only
+    # no jq → create-only (don’t overwrite)
     [ -f "$TASKS" ] || printf '%s\n' "$(cat <<JSON
 {
   "version": "2.0.0",
@@ -97,7 +100,6 @@ JSON
 
 # ---- hashing helpers (Argon2) ----
 try_hash_with(){
-  # $1 = program (npx|corepack) ; $2... = args
   prog="$1"; shift
   if command -v "$prog" >/dev/null 2>&1; then
     out="$(printf '%s' "$NEW" | "$prog" "$@" 2>/dev/null || true)"
@@ -109,14 +111,11 @@ try_hash_with(){
 }
 
 make_argon2_hash(){
-  # Prefer npx argon2-cli; fall back to pnpm/yarn dlx if available
-  # Official docs recommend argon2-cli for code-server hashed-password. :contentReference[oaicite:2]{index=2}
+  # Prefer npx argon2-cli; fall back to pnpm/yarn via corepack if present
   if h="$(try_hash_with npx --yes argon2-cli -e)"; then printf '%s' "$h"; return 0; fi
   if h="$(try_hash_with corepack pnpm dlx argon2-cli -e)"; then printf '%s' "$h"; return 0; fi
   if h="$(try_hash_with corepack yarn dlx argon2-cli -s -q -y argon2-cli -e)"; then printf '%s' "$h"; return 0; fi
-
   echo "Error: could not generate Argon2 hash (need npx or pnpm/yarn via corepack)." >&2
-  echo "Hint: Internet access is required the first time to fetch argon2-cli." >&2
   return 1
 }
 
@@ -143,7 +142,7 @@ write_hashed_and_restart(){
 
   hash="$(NEW="$NEW" make_argon2_hash)" || exit 1
 
-  # Write hash without trailing newline
+  # Write hash (no trailing newline)
   printf '%s' "$hash" > "$HASH_FILE"
   chmod 644 "$HASH_FILE" || true
   chown "$PUID:$PGID" "$HASH_FILE" 2>/dev/null || true
@@ -151,9 +150,9 @@ write_hashed_and_restart(){
 
   ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
   size="$(wc -c < "$HASH_FILE" 2>/dev/null || echo 0)"
-  headsig="$(cut -c1-16 < "$HASH_FILE" 2>/dev/null || true)"
-  log "hashed password saved to $HASH_FILE (utc=$ts bytes=$size head=${headsig}...)"
-  log "container will restart; code-server will read HASHED_PASSWORD from file (takes precedence over PASSWORD)."
+  head="$(cut -c1-20 < "$HASH_FILE" 2>/dev/null || true)"
+  log "hashed password saved to $HASH_FILE (utc=$ts bytes=$size head=${head}...)"
+  log "container will restart; code-server will read FILE__HASHED_PASSWORD."
 
   trigger_restart_gate
   exit 0

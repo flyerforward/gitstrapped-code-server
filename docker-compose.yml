@@ -17,6 +17,7 @@ services:
       - projects:/config/workspace
       - ./settings.json:/config/gitstrap/settings.json:ro
       - ./gitstrap.sh:/custom-cont-init.d/10-gitstrap.sh:ro
+      - ./codepass.sh:/custom-cont-init.d/20-codepass.sh:ro 
     ports:
       - ":8443"
     restart: always

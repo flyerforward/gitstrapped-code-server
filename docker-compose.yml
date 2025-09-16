@@ -7,13 +7,10 @@ services:
       PGID: "1000"
       TZ: "America/Toronto"
 
-      # Read login password from this file at container (re)start
+      # Read login password from this file on container (re)start
       FILE__PASSWORD: "/config/.gitstrap/codepass.txt"
 
-      # Let the password task know what to restart via Docker API
-      SELF_CONTAINER_NAME: "code-server"
-
-      # Git bootstrap envs (optional for autorun; otherwise use the Ctrl+Alt+G task)
+      # Optional: used by your gitstrap bootstrap flow
       GH_USER: "${GH_USER}"
       GH_PAT: "${GH_PAT}"
       GIT_NAME: "${GIT_NAME}"
@@ -22,17 +19,45 @@ services:
       GIT_BASE_DIR: "/config/workspace"
 
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock           # allow self-restart via Docker API
       - code-config:/config
       - projects:/config/workspace
-      - ./dockersock-group.sh:/custom-cont-init.d/01-dockersock-group.sh:ro  # <-- auto map socket GID
       - ./settings.json:/config/gitstrap/settings.json:ro
       - ./gitstrap.sh:/custom-cont-init.d/10-gitstrap.sh:ro
       - ./codepass.sh:/custom-cont-init.d/20-codepass.sh:ro
+      # (No docker.sock or dockersock-group here anymore)
 
     ports:
-      - ":8443"   # map as you like, e.g. "8443:8443"
+      - ":8443"   # or "8443:8443"
 
+    restart: always
+
+  # Sidecar that watches the password file and restarts the code-server container when it changes
+  restartd:
+    image: curlimages/curl:8.8.0
+    container_name: code-server-restartd
+    depends_on:
+      - code
+    environment:
+      CONTAINER_NAME: "code-server"
+      PASSWORD_FILE: "/config/.gitstrap/codepass.txt"
+      DOCKER_SOCK: "/var/run/docker.sock"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # RW so it can call the Docker API
+      - code-config:/config:ro                      # read the same /config volume to watch the password file
+    command: >
+      sh -eu -c '
+        echo "[restartd] watching $PASSWORD_FILE for changes to restart $CONTAINER_NAME";
+        last="";
+        while :; do
+          ts="$(stat -c %Y "$PASSWORD_FILE" 2>/dev/null || true)";
+          if [ -n "$ts" ] && [ "$ts" != "$last" ]; then
+            last="$ts";
+            echo "[restartd] change detected; requesting restart";
+            code="$(curl --unix-socket "$DOCKER_SOCK" -s -o /dev/null -w "%{http_code}" -X POST "http://localhost/v1.41/containers/${CONTAINER_NAME}/restart" || true)";
+            echo "[restartd] docker api returned $code";
+          fi;
+          sleep 2;
+        done'
     restart: always
 
 volumes:

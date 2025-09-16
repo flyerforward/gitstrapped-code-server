@@ -37,6 +37,7 @@ install_task(){
   ensure_dir "$(dirname "$KEYB")"
 
   if command -v jq >/dev/null 2>&1; then
+    # ---- tasks.json upsert
     tmp="$(mktemp)"
     if [ -f "$TASKS" ] && jq -e . "$TASKS" >/dev/null 2>&1; then
       jq --argjson newtask "$TASK_JSON" --argjson newinputs "$INPUTS_JSON" '
@@ -65,6 +66,7 @@ JSON
 )" > "$TASKS"
     fi
 
+    # ---- keybindings.json upsert (array)
     tmp="$(mktemp)"
     if [ -f "$KEYB" ] && jq -e . "$KEYB" >/dev/null 2>&1; then
       jq --argjson kb "$KB_JSON" '
@@ -78,6 +80,7 @@ JSON
       printf '[%s]\n' "$KB_JSON" > "$KEYB"
     fi
   else
+    # no jq → create-only (don’t overwrite)
     [ -f "$TASKS" ] || printf '%s\n' "$(cat <<JSON
 {
   "version": "2.0.0",
@@ -93,70 +96,10 @@ JSON
   log "installed VS Code task & keybinding"
 }
 
-docker_restart_self(){
-  # Requires: -v /var/run/docker.sock:/var/run/docker.sock (RW)
-  # And the container user must have permission on that socket.
-  sock="${DOCKER_SOCK:-/var/run/docker.sock}"
-  [ -S "$sock" ] || return 1
+write_password_and_exit_ok(){
+  NEW="${1:-}"
+  CONF="${2:-}"
 
-  # Use curl to the Docker Engine API
-  command -v curl >/dev/null 2>&1 || return 1
-
-  # Prefer explicit container name if provided via env
-  self_name="${SELF_CONTAINER_NAME:-}"
-  if [ -n "$self_name" ]; then
-    code="$(curl --unix-socket "$sock" -s -o /dev/null -w '%{http_code}' \
-      -X POST "http://localhost/v1.41/containers/${self_name}/restart")" || true
-    [ "$code" = "204" ] || [ "$code" = "304" ] && { log "requested docker restart for $self_name"; return 0; }
-  fi
-
-  # Fallback: derive our container ID from cgroups/hostname
-  cid="$(grep -Eo '([0-9a-f]{64})' /proc/self/cgroup 2>/dev/null | head -n1 || true)"
-  if [ -z "$cid" ] && [ -r /etc/hostname ]; then
-    hn="$(cat /etc/hostname 2>/dev/null || true)"
-    echo "$hn" | grep -Eq '^[0-9a-f]{12,64}$' && cid="$hn" || true
-  fi
-  [ -n "$cid" ] || return 1
-
-  code="$(curl --unix-socket "$sock" -s -o /dev/null -w '%{http_code}' \
-    -X POST "http://localhost/v1.41/containers/${cid}/restart")" || true
-  if [ "$code" = "204" ] || [ "$code" = "304" ]; then
-    log "requested docker restart for container $cid"
-    return 0
-  fi
-  return 1
-}
-
-restart_container(){
-  log "requesting supervised shutdown so Docker restarts the container..."
-
-  # 1) Try s6 supervisor (usually needs root; harmless if denied)
-  if command -v s6-svscanctl >/dev/null 2>&1; then
-    for dir in /run/service /run/s6/services /run/s6; do
-      if [ -d "$dir" ] && s6-svscanctl -t "$dir" 2>/dev/null; then
-        log "signalled s6 supervisor at $dir"
-        exit 0
-      fi
-    done
-  fi
-
-  # 2) Try Docker Engine API via /var/run/docker.sock (works for UID 1000 if granted)
-  if docker_restart_self; then
-    exit 0
-  fi
-
-  # 3) Last resort (likely blocked for non-root)
-  if kill -TERM 1 2>/dev/null; then
-    log "sent TERM to PID 1"
-    exit 0
-  fi
-
-  echo "Error: couldn't restart container automatically (permissions). Please 'docker restart <container>' once; new password is saved at $PASS_FILE." >&2
-  exit 1
-}
-
-write_password_and_restart(){
-  NEW="$1"; CONF="$2"
   [ -n "$NEW" ]  || { echo "Error: password is required." >&2; exit 1; }
   [ -n "$CONF" ] || { echo "Error: confirmation is required." >&2; exit 1; }
   [ "$NEW" = "$CONF" ] || { echo "Error: passwords do not match." >&2; exit 1; }
@@ -166,13 +109,15 @@ write_password_and_restart(){
   printf '%s' "$NEW" > "$PASS_FILE"
   chmod 600 "$PASS_FILE" || true
   chown "$PUID:$PGID" "$PASS_FILE" 2>/dev/null || true
-  log "wrote new password to $PASS_FILE (used via FILE__PASSWORD at boot)"
 
-  restart_container
+  log "password saved to $PASS_FILE"
+  log "sidecar will detect the change and restart the container shortly"
+  # IMPORTANT: exit 0 so the VS Code task shows as successful
+  exit 0
 }
 
 case "${1:-init}" in
   init) install_task ;;
-  set)  shift; write_password_and_restart "${1:-}" "${2:-}" ;;
+  set)  shift; write_password_and_exit_ok "${1:-}" "${2:-}" ;;
   *)    install_task ;;
 esac

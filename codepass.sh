@@ -97,8 +97,8 @@ JSON
 
 trigger_restart_hook(){
   if command -v curl >/dev/null 2>&1; then
-    if curl -fsS --max-time 3 "http://127.0.0.1:9000/cgi-bin/restart" >/dev/null 2>&1; then
-      log "restart gate responded at 127.0.0.1:9000/cgi-bin/restart"
+    if curl -fsS --max-time 3 "http://127.0.0.1:9000/restart" >/dev/null 2>&1; then
+      log "restart gate responded at 127.0.0.1:9000/restart"
     else
       log "WARN: restart trigger failed (cannot reach 127.0.0.1:9000)"
     fi

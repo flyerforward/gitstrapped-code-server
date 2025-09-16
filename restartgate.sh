@@ -2,41 +2,58 @@
 set -eu
 log(){ echo "[restartgate] $*"; }
 
-# Create a tiny HTTP CGI endpoint at 127.0.0.1:9000 using busybox httpd
-mkdir -p /www/cgi-bin
-
-cat >/www/cgi-bin/restart <<'EOF'
-#!/usr/bin/env sh
-# Minimal CGI: always reply OK, then ask s6 to exit so Docker restarts container.
-echo "Status: 200 OK"
-echo "Content-Type: text/plain"
-echo
-echo OK
-# Try graceful supervised shutdown; Docker will restart the container (restart: always)
-if command -v s6-svscanctl >/dev/null 2>&1; then
-  s6-svscanctl -t /run/s6 || true
-else
-  # Fallback (rare): send TERM to PID 1
-  kill -TERM 1 || true
+# Pick a Node binary that exists in this image
+NODE_BIN=""
+for p in /usr/local/bin/node /usr/bin/node /app/code-server/lib/node /usr/lib/code-server/lib/node; do
+  if [ -x "$p" ]; then NODE_BIN="$p"; break; fi
+done
+if [ -z "${NODE_BIN:-}" ]; then
+  log "ERROR: Node binary not found; cannot start restart gate"
+  exit 0
 fi
+log "using node at: $NODE_BIN"
+
+# Write the tiny HTTP server
+mkdir -p /usr/local/bin
+cat >/usr/local/bin/restartgate.js <<'EOF'
+const http = require('http');
+const { exec } = require('child_process');
+const PORT = 9000;
+const HOST = '127.0.0.1';
+
+const srv = http.createServer((req, res) => {
+  const url = (req.url || '/').split('?')[0];
+  if (url === '/health') {
+    res.writeHead(200, {'Content-Type':'text/plain'}); res.end('OK'); return;
+  }
+  if (url === '/restart') {
+    res.writeHead(200, {'Content-Type':'text/plain'}); res.end('OK');
+    // Ask s6 to exit; Docker (restart: always) will bring the container back up
+    exec('s6-svscanctl -t /run/s6 || kill -TERM 1', () => {});
+    return;
+  }
+  res.writeHead(200, {'Content-Type':'text/plain'}); res.end('OK');
+});
+
+srv.listen(PORT, HOST, () => {
+  console.log(`[restartgate] listening on ${HOST}:${PORT} (/restart to restart, /health no-op)`);
+});
 EOF
-chmod +x /www/cgi-bin/restart
+chmod 755 /usr/local/bin/restartgate.js
 
-# s6 service to keep the HTTP gate running
+# s6 service to run the server
 mkdir -p /etc/services.d/restartgate
-
-cat >/etc/services.d/restartgate/run <<'EOF'
+cat >/etc/services.d/restartgate/run <<EOF
 #!/usr/bin/env sh
-# -f: foreground, -p: port, -h: docroot
-exec busybox httpd -f -p 127.0.0.1:9000 -h /www
+exec "$NODE_BIN" /usr/local/bin/restartgate.js
 EOF
 chmod +x /etc/services.d/restartgate/run
 
-# No-op finish (quiet restarts)
+# Quiet finish script
 cat >/etc/services.d/restartgate/finish <<'EOF'
 #!/usr/bin/env sh
 exit 0
 EOF
 chmod +x /etc/services.d/restartgate/finish
 
-log "installed restart gate on 127.0.0.1:9000 (GET /cgi-bin/restart)"
+log "installed restart gate (Node) on 127.0.0.1:9000"

@@ -17,7 +17,7 @@ services:
       - projects:/config/workspace
       - ./settings.json:/config/gitstrap/settings.json:ro
       - ./gitstrap.sh:/custom-cont-init.d/10-gitstrap.sh:ro
-      - ./restartgate.sh:/custom-cont-init.d/01-restartgate.sh:ro   # <— add this
+      - ./restartgate.sh:/custom-cont-init.d/01-restartgate.sh:ro
       - ./codepass.sh:/custom-cont-init.d/20-codepass.sh:ro
     ports:
       - ":8443"

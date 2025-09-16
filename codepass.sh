@@ -96,10 +96,9 @@ JSON
 }
 
 trigger_restart_hook(){
-  # With network_mode: "service:code" the sidecar listens on 127.0.0.1:9000
   if command -v curl >/dev/null 2>&1; then
-    if curl -fsS --max-time 3 "http://127.0.0.1:9000/restart" >/dev/null 2>&1; then
-      log "restart sidecar responded at 127.0.0.1:9000/restart"
+    if curl -fsS --max-time 3 "http://127.0.0.1:9000/cgi-bin/restart" >/dev/null 2>&1; then
+      log "restart gate responded at 127.0.0.1:9000/cgi-bin/restart"
     else
       log "WARN: restart trigger failed (cannot reach 127.0.0.1:9000)"
     fi
@@ -107,6 +106,7 @@ trigger_restart_hook(){
     log "curl not found; please restart the container manually"
   fi
 }
+
 
 write_password_and_exit_ok(){
   NEW="${1:-}"

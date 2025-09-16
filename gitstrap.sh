@@ -9,7 +9,7 @@ redact(){ echo "$1" | sed 's/[A-Za-z0-9_\-]\{12,\}/***REDACTED***/g'; }
 ensure_dir(){ mkdir -p "$1" 2>/dev/null || true; chown -R "$PUID:$PGID" "$1" 2>/dev/null || true; }
 write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1" 2>/dev/null || true; }
 
-# temp file in same dir (avoid inter-device mv)
+# temp file in same dir (avoid inter-device mv Permission denied)
 mktemp_in_dir(){
   dir="$(dirname "$1")"; base="$(basename "$1")"
   ensure_dir "$dir"
@@ -40,8 +40,11 @@ PUBLIC_KEY_PATH="$SSH_DIR/${KEY_NAME}.pub"
 LOCK_DIR="/run/gitstrap"
 LOCK_FILE="$LOCK_DIR/autorun.lock"; mkdir -p "$LOCK_DIR" 2>/dev/null || true
 
+# file that code-server reads on boot for auth (compose sets FILE__HASHED_PASSWORD)
 PASS_HASH_PATH="${FILE__HASHED_PASSWORD:-$STATE_DIR/codepass.hash}"
+# first-boot restart marker (processed by restart gate service)
 FIRSTBOOT_MARKER="$STATE_DIR/.firstboot-auth-restart"
+
 GITSTRAP_FLAG='__gitstrap_settings'
 
 # ========= bool normalize =========
@@ -53,7 +56,7 @@ normalize_bool(){
   else echo "true"; fi
 }
 
-# ========= restart gate =========
+# ========= restart gate (install s6 service + tiny HTTP) =========
 install_restart_gate(){
   NODE_BIN=""
   for p in /usr/local/bin/node /usr/bin/node /app/code-server/lib/node /usr/lib/code-server/lib/node; do
@@ -105,7 +108,7 @@ EOF
   log "installed restart gate service (Node) on 127.0.0.1:9000"
 }
 
-# ========= default password =========
+# ========= default password (first boot only) =========
 init_default_password(){
   DEFAULT_PASSWORD="${DEFAULT_PASSWORD:-}"
   [ -n "$DEFAULT_PASSWORD" ] || { log "DEFAULT_PASSWORD not set; skipping default hash"; return 0; }
@@ -245,123 +248,125 @@ install_user_assets(){
   fi
 
   if command -v jq >/dev/null 2>&1; then
-    # ---- tasks.json upsert with guards + prune old flagged tasks
-    tmp_out="$(mktemp_in_dir "$TASKS_PATH")"
+    # ---- tasks.json upsert (ONE task) with guards + prune old flagged tasks
+    tmp_tasks="$(mktemp_in_dir "$TASKS_PATH")"
     if [ -f "$TASKS_PATH" ] && jq -e . "$TASKS_PATH" >/dev/null 2>&1; then
       jq \
         --arg flag "$GITSTRAP_FLAG" \
-        --argjson desired "[$GITSTRAP_TASK]" '
+        --argjson task "$GITSTRAP_TASK" '
           def ensureObj(o): if (o|type)=="object" then o else {} end;
           def ensureArr(a): if (a|type)=="array"  then a else [] end;
-          def merge_with_preserve($old; $incoming; $flag):
+          def merge_with_preserve($old; $incoming; $flag){
             ($incoming + {($flag): true})
             | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
-            | ( reduce (($old.gitstrap_preserve // [])[]) as $k ( . ; .[$k] = ($old[$k] // .[$k]) ) );
+            | ( reduce (($old.gitstrap_preserve // [])[]) as $k (. ; .[$k] = ($old[$k] // .[$k]) ) )
+          };
 
           (ensureObj(.)) as $root
           | ($root.tasks // []) as $tasks_raw
-          | (if ($tasks_raw|type)=="array" then $tasks_raw else [] end) as $tasks_arr
-          | ($tasks_arr | map(select(type=="object")))   as $task_objs
-          | ($tasks_arr | map(select(type!="object")))   as $task_nonobjs
+          | (ensureArr($tasks_raw)) as $tasks
+          | ($tasks | map(select(type=="object"))) as $objs
+          | ($tasks | map(select(type!="object"))) as $nonobjs
           | .version = (.version // "2.0.0")
-          | ($desired | map(.label) | unique) as $dlabels
 
-          # prune flagged tasks we no longer manage, keep unflagged and non-objects
-          | ($task_objs | map(
-              if ((.[$flag]? // false) == true)
-              then if ($dlabels | index((.label? // ""))) then . else empty end
+          # keep: unflagged + flagged that match our label; drop other flagged we manage
+          | ($objs | map(
+              if ((.[$flag]? // false)==true)
+              then if ((.label? // "") == ($task.label // "")) then . else empty end
               else . end
-            )) as $t0
+            )) as $kept
 
-          # upsert our single task by label (guard on type)
+          # upsert our one task by label
           | .tasks = (
-              reduce $desired[] as $nt (
-                $t0;
-                if any(.[]?; (type=="object") and ((.[$flag]? // false)==true) and ((.label? // "") == ($nt.label // ""))) then
-                  map(if (type=="object") and ((.[$flag]? // false)==true) and ((.label? // "")==($nt.label // ""))
-                      then merge_with_preserve(.; $nt; $flag) else . end)
-                else . + [ $nt ] end
-              )
-              + $task_nonobjs
-            )
-
-          # inputs strict upsert by id, prune flagged unknown ids
-          | (.inputs // []) as $inputs_raw
-          | (ensureArr($inputs_raw)) as $inputs
-          | ($desired_inputs // []) as $noop
-        ' "$TASKS_PATH" > "$tmp_out"
-
-      # separate pass for inputs (so we can reuse .tasks result above)
-      jq \
-        --arg flag "$GITSTRAP_FLAG" \
-        --argjson newinputs "$INPUTS_JSON" '
-          def ensureArr(a): if (a|type)=="array" then a else [] end;
-          def merge_with_preserve($old; $incoming; $flag):
-            ($incoming + {($flag): true})
-            | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
-            | ( reduce (($old.gitstrap_preserve // [])[]) as $k ( . ; .[$k] = ($old[$k] // .[$k]) ) );
-          (.inputs // []) as $inputs
-          | .inputs = (
-              ensureArr($inputs) as $cur
-              | ($newinputs | map(select(.id? != null) | .id) | unique) as $want
-              | ( $cur
-                  | map(
-                      if ( (type=="object") and ((.[$flag]? // false)==true)
-                           and ((.id? // "") as $id | ($want | index($id) | not)) )
-                      then empty else . end
-                    )
-                ) as $filtered
-              | reduce $newinputs[] as $inc (
-                  $filtered;
-                  ( ($inc.id? // "") ) as $id
-                  | if $id == "" then .
-                    else if any(.[]?; (type=="object") and ((.id? // "") == $id)) then
-                      map( if ( (type=="object") and ((.id? // "") == $id) )
-                        then ( if ((.[$flag]? // false) == true) then merge_with_preserve(.; $inc; $flag) else $inc end )
-                        else . end )
-                    else . + [ $inc ] end
-                  end
-                )
-            )
-        ' "$tmp_out" | tee "$tmp_out" >/dev/null
-
-      mv -f "$tmp_out" "$TASKS_PATH"
+              if any($kept[]?; (type=="object") and ((.[$flag]? // false)==true) and ((.label? // "")==($task.label // ""))) then
+                ($kept | map(
+                  if ( (type=="object") and ((.[$flag]? // false)==true) and ((.label? // "")==($task.label // "")) )
+                  then merge_with_preserve(.; $task; $flag)
+                  else .
+                  end))
+              else
+                $kept + [ $task ]
+              end
+            ) + $nonobjs
+        ' "$TASKS_PATH" > "$tmp_tasks" && mv -f "$tmp_tasks" "$TASKS_PATH"
     else
       printf '%s\n' "$(cat <<JSON
 {
   "version": "2.0.0",
   "tasks": [ $GITSTRAP_TASK ],
-  "inputs": $INPUTS_JSON
+  "inputs": []
 }
 JSON
 )" > "$TASKS_PATH"
     fi
 
-    # ---- keybindings.json upsert (guard non-objects) + remove old password binding
+    # ---- inputs strict upsert by id; prune flagged unknown ids; guard non-objects
+    tmp_tasks2="$(mktemp_in_dir "$TASKS_PATH")"
+    jq \
+      --arg flag "$GITSTRAP_FLAG" \
+      --argjson newinputs "$INPUTS_JSON" '
+        def ensureArr(a): if (a|type)=="array" then a else [] end;
+        def merge_with_preserve($old; $incoming; $flag){
+          ($incoming + {($flag): true})
+          | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
+          | ( reduce (($old.gitstrap_preserve // [])[]) as $k (. ; .[$k] = ($old[$k] // .[$k]) ) )
+        };
+
+        (.inputs // []) as $cur_raw
+        | (ensureArr($cur_raw)) as $cur
+        | ($cur | map(select(type=="object"))) as $objs
+        | ($cur | map(select(type!="object"))) as $nonobjs
+        | ($newinputs | map(select(.id? != null) | .id) | unique) as $ids
+
+        # drop flagged inputs we no longer manage
+        | ($objs | map(
+            if ((.[$flag]? // false)==true) and (($ids | index(.id? // "")) | not)
+            then empty else . end
+          )) as $kept
+
+        # upsert each desired input by id
+        | .inputs = (
+            reduce $newinputs[] as $inc (
+              $kept;
+              ($inc.id // "") as $id
+              | if $id == "" then .
+                else
+                  if any(.[]?; (type=="object") and ((.id? // "")==$id)) then
+                    map( if ( (type=="object") and ((.id? // "")==$id) )
+                         then ( if ((.[$flag]? // false)==true) then merge_with_preserve(.; $inc; $flag) else $inc end )
+                         else . end )
+                  else . + [ $inc ] end
+                end
+            ) + $nonobjs
+          )
+      ' "$TASKS_PATH" > "$tmp_tasks2" && mv -f "$tmp_tasks2" "$TASKS_PATH"
+
+    # ---- keybindings.json upsert (two bindings map to same task) + remove old password binding
     tmp_kb="$(mktemp_in_dir "$KEYB_PATH")"
     if [ -f "$KEYB_PATH" ] && jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
       jq \
         --arg flag "$GITSTRAP_FLAG" \
         --argjson newkbs "[$KB_G, $KB_P]" '
           def ensureArr(a): if (a|type)=="array" then a else [] end;
-          def merge_with_preserve($old; $incoming; $flag):
+          def merge_with_preserve($old; $incoming; $flag){
             ($incoming + {($flag): true})
             | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
-            | ( reduce (($old.gitstrap_preserve // [])[]) as $k ( . ; .[$k] = ($old[$k] // .[$k]) ) );
+            | ( reduce (($old.gitstrap_preserve // [])[]) as $k (. ; .[$k] = ($old[$k] // .[$k]) ) )
+          };
 
           (ensureArr(.)) as $arr
-          | ($arr | map(select(type=="object")))   as $kb_objs
-          | ($arr | map(select(type!="object")))   as $kb_nonobjs
+          | ($arr | map(select(type=="object"))) as $objs
+          | ($arr | map(select(type!="object"))) as $nonobjs
 
           # remove any old flagged binding pointing to the old password task
-          | ($kb_objs | map(
+          | ($objs | map(
               if ((.[$flag]? // false)==true
                   and (.command? // "")=="workbench.action.tasks.runTask"
                   and (.args? // "")=="Change code-server password")
               then empty else . end
             )) as $clean
 
-          # upsert by (command,args,key), guard on objects
+          # upsert by (command,args,key)
           | reduce $newkbs[] as $nk (
               $clean;
               if any(.[]?; (type=="object")
@@ -376,8 +381,7 @@ JSON
                      else . end )
               else . + [ $nk ] end
             )
-
-          | . + $kb_nonobjs
+          | . + $nonobjs
         ' "$KEYB_PATH" > "$tmp_kb" && mv -f "$tmp_kb" "$KEYB_PATH"
     else
       printf '[%s,%s]\n' "$KB_G" "$KB_P" > "$KEYB_PATH"
@@ -395,11 +399,11 @@ JSON
     [ -f "$KEYB_PATH" ] || printf '[%s,%s]\n' "$KB_G" "$KB_P" > "$KEYB_PATH"
   fi
 
-  chown "$PUID:$PGID" "$TASKS_PATH" "$KEYB_PATH" 2>/dev/null || true
+  chown "$PUID:$PGID" "$TASKS_PATH" "$KEYB_PATH" 2>/div/null || true
   log "installed/merged single task, inputs, and keybindings"
 }
 
-# ========= settings merge =========
+# ========= settings merge (repo -> user) with preserve =========
 install_settings_from_repo(){
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo settings.json; skipping settings merge"; return 0; }
   if ! command -v jq >/dev/null 2>&1; then
@@ -579,7 +583,7 @@ do_gitstrap(){
   log "gitstrap done"
 }
 
-# ========= orchestrate =========
+# ========= main phases =========
 autorun_or_hint(){
   if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ] && [ ! -f "$LOCK_FILE" ]; then
     : > "$LOCK_FILE" || true
@@ -587,7 +591,7 @@ autorun_or_hint(){
     do_gitstrap || true
   else
     [ -f "$LOCK_FILE" ] && log "autorun lock present → skipping duplicate gitstrap this start"
-    { [ -z "${GH_USER:-}" ] || [ -z "${GH_PAT:-}" ]; } && log "GH_USER/GH_PAT missing → skip autorun (use Ctrl+Alt+G / Ctrl+Alt+P)"
+    { [ -z "${GH_USER:-}" ] || [ -z "${GH_PAT:-}" ] ; } && log "GH_USER/GH_PAT missing → skip autorun (use Ctrl+Alt+G)"
   fi
 }
 
@@ -606,8 +610,11 @@ ensure_assets_and_settings(){
 }
 
 case "${1:-init}" in
-  init) init_all ;;
+  init)
+    init_all
+    ;;
   force)
+    # Merge assets/settings before the run so VS Code prompts appear as expected
     ensure_assets_and_settings
     if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ]; then
       do_gitstrap
@@ -623,5 +630,7 @@ case "${1:-init}" in
   settings-merge)  install_settings_from_repo ;;
   gate-install)    install_restart_gate ;;
   default-pass)    init_default_password ;;
-  *)               init_all ;;
+  *)
+    init_all
+    ;;
 esac

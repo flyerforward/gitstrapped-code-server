@@ -19,7 +19,7 @@ services:
       GIT_BASE_DIR: "/config/workspace"
 
     volumes:
-      - code-config:/config12
+      - code-config:/config123
       - code-config:/config
       - projects:/config/workspace
       - ./settings.json:/config/gitstrap/settings.json:ro
@@ -36,7 +36,7 @@ services:
   restartd:
     image: alpine:3.20
     container_name: code-server-restartd
-    user: "0:0"                             # needs access to /var/run/docker.sock
+    user: "0:0"                           # needs access to /var/run/docker.sock
     depends_on:
       - code
     volumes:
@@ -48,18 +48,22 @@ services:
         apk add --no-cache curl socat >/dev/null
         cat >/usr/local/bin/restart-hook <<'EOF'
         #!/usr/bin/env sh
-        # read and discard the HTTP request headers until blank line
+        # Log to container stdout:
+        echo "[restartd] trigger received from ${SOCAT_PEERADDR:-unknown}:${SOCAT_PEERPORT:-?}" >&2
+        # Read and discard request headers until blank line:
         while IFS= read -r line; do [ -z "$line" ] && break; done
-        # respond immediately
+        # Respond 200 OK quickly:
         printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
-        # do the restart in the background (so the client returns fast)
+        # Restart code-server in the background:
         curl --unix-socket /var/run/docker.sock -s -o /dev/null \
           -X POST http://localhost/v1.41/containers/code-server/restart >/dev/null 2>&1 &
         EOF
         chmod +x /usr/local/bin/restart-hook
         echo "[restartd] listening on :9000 (GET / to restart code-server)"
-        exec socat TCP-LISTEN:9000,reuseaddr,fork,keepalive EXEC:/usr/local/bin/restart-hook,setsid
+        # fork: one process per connection; setsid so hook can background safely
+        exec socat TCP-LISTEN:9000,reuseaddr,fork,keepalive,crlf EXEC:/usr/local/bin/restart-hook,setsid,pty,stderr
     restart: always
+
 
 
 

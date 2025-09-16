@@ -91,11 +91,17 @@ JSON
 }
 
 trigger_restart_hook(){
+  # Use the Compose service name: "restartd" (NOT the container_name)
+  URL="http://restartd:9000/"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsS --max-time 2 http://code-server-restartd:9000/ >/dev/null 2>&1 || true
-    log "sent restart trigger to sidecar (GET /)"
+    if out="$(curl -fsS --max-time 3 "$URL" 2>&1)"; then
+      log "restart sidecar responded: $(printf %s "$out" | tr -d '\n' | head -c 80)"
+    else
+      code=$?
+      log "WARN: restart trigger failed (curl exit $code) → URL=$URL ; details: $out"
+    fi
   else
-    log "curl not found; please restart the container manually"
+    log "curl not found; please restart container manually"
   fi
 }
 

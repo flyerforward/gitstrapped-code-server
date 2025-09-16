@@ -197,7 +197,7 @@ maybe_apply_password_from_env(){
   fi
 }
 
-# ========= VS Code tasks & keybindings (single task + inputs) =========
+# ========= VS Code assets (single task + inputs) =========
 install_user_assets(){
   ensure_dir "$USER_DIR"
 
@@ -236,7 +236,7 @@ install_user_assets(){
     { "__gitstrap_settings": true, "id": "confirm_password", "type": "promptString", "description": "Confirm the NEW password (leave blank to skip)", "password": true, "gitstrap_preserve": [] }
   ]'
 
-  # Two shortcuts → same single task (so Ctrl+Alt+P still works)
+  # Two shortcuts → same single task (Ctrl+Alt+G and Ctrl+Alt+P)
   KB_G='{
     "__gitstrap_settings": true,
     "key": "ctrl+alt+g",
@@ -270,8 +270,7 @@ install_user_assets(){
     if [ -f "$TASKS_PATH" ] && jq -e . "$TASKS_PATH" >/dev/null 2>&1; then
       jq \
         --arg flag "$GITSTRAP_FLAG" \
-        --argjson desired "[$GITSTRAP_TASK]" \
-        '
+        --argjson desired "[$GITSTRAP_TASK]" '
           def ensureObj(o): if (o|type)=="object" then o else {} end;
           def ensureArr(a): if (a|type)=="array"  then a else [] end;
           def merge_with_preserve($old; $incoming; $flag):
@@ -284,11 +283,13 @@ install_user_assets(){
           | ($root.inputs // []) as $inputs
           | .version = (.version // "2.0.0")
 
+          | ($desired | map(.label) | unique) as $dlabels
+
           # prune old flagged tasks we no longer manage (e.g., "Change code-server password")
           | ($tasks | ensureArr(.) | map(
               if ((.[$flag]? // false) == true)
-                 then if ([ $desired[] | .label ] | index(.label // "")) then . else empty end
-                 else . end
+              then if ($dlabels | index(.label // "")) then . else empty end
+              else . end
             )) as $t0
 
           # upsert our single desired task by label
@@ -300,17 +301,9 @@ install_user_assets(){
                 else . + [ $nt ] end
               )
             )
-
-          # ---- inputs strict upsert by id, and prune flagged inputs not in desired set of ids
-          | ($inputs | ensureArr(.)) as $cur
-          | ($desired | first | . as $d | [ $d ] ) as $d_wrap # just to satisfy jq
-          | ($d_wrap | first) as $one
-          | ($one|.inputs? // [] ) as $none # placeholder
-          | ($inputs) as $orig
-
-          # real desired inputs passed separately
         ' "$TASKS_PATH" > "$tmp_out"
-      # second pass handles inputs (separate to keep it readable)
+
+      # ---- inputs strict upsert by id, prune flagged unknown ids
       jq \
         --arg flag "$GITSTRAP_FLAG" \
         --argjson newinputs "$INPUTS_JSON" '
@@ -326,7 +319,9 @@ install_user_assets(){
               # remove flagged inputs not in desired set
               | ($newinputs | map(select(.id? != null) | .id) | unique) as $want
               | ( $cur | map(
-                    if ((.[$flag]? // false)==true and (.id? // "") as $id | ($want | index($id) | not))
+                    if ((.[$flag]? // false)==true
+                        and (.id? // "") as $id
+                        | ($want | index($id) | not))
                        then empty else . end
                 )) as $filtered
               # upsert desired by id
@@ -362,11 +357,10 @@ JSON
         --arg flag "$GITSTRAP_FLAG" \
         --argjson newkbs "[$KB_G, $KB_P]" '
           def ensureArr(a): if (a|type)=="array" then a else [] end;
-          def merge_with_preserve($old; $incoming; $flag){
+          def merge_with_preserve($old; $incoming; $flag):
             ($incoming + {($flag): true})
             | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
-            | ( reduce (($old.gitstrap_preserve // [])[]) as $k ( . ; .[$k] = ($old[$k] // .[$k]) ) )
-          };
+            | ( reduce (($old.gitstrap_preserve // [])[]) as $k ( . ; .[$k] = ($old[$k] // .[$k]) ) );
 
           (ensureArr(.)) as $arr
           # remove any old flagged binding that still points to "Change code-server password"
@@ -377,7 +371,7 @@ JSON
                 then empty else . end
             )) as $clean
 
-          # upsert by (command,args,key) triple to allow multiple keys for same task
+          # upsert by (command,args,key) triple to allow two keys for same task
           | reduce $newkbs[] as $nk (
               $clean;
               if any(.[]?; (.command? // "")==($nk.command // "")
@@ -502,10 +496,10 @@ do_gitstrap(){
   git config --global init.defaultBranch main || true
   git config --global pull.ff only || true
   git config --global advice.detachedHead false || true
-  git config --global --add safe.directory "$BASE" || true
-  git config --global --add safe.directory "$BASE/*" || true
-  git config --global user.name "$GIT_NAME" || true
+  # Allow repos mounted with different ownership inside the container
+  git config --global --add safe.directory "*"
 
+  git config --global user.name "$GIT_NAME" || true
   if [ -z "${GIT_EMAIL:-}" ]; then GIT_EMAIL="$(resolve_email || true)"; fi
   git config --global user.email "$GIT_EMAIL" || true
   log "identity: $GIT_NAME <$GIT_EMAIL>"
@@ -604,7 +598,7 @@ autorun_or_hint(){
     do_gitstrap || true
   else
     [ -f "$LOCK_FILE" ] && log "autorun lock present → skipping duplicate gitstrap this start"
-    { [ -z "${GH_USER:-}" ] || [ -z "${GH_PAT:-}" ]; } && log "GH_USER/GH_PAT missing → skip autorun (use Ctrl+Alt+G/ Ctrl+Alt+P)"
+    { [ -z "${GH_USER:-}" ] || [ -z "${GH_PAT:-}" ]; } && log "GH_USER/GH_PAT missing → skip autorun (use Ctrl+Alt+G / Ctrl+Alt+P)"
   fi
 }
 
@@ -624,7 +618,7 @@ ensure_assets_and_settings(){
 
 case "${1:-init}" in
   init) init_all ;;
-  # "force" now: refresh assets/settings first, then run gitstrap if GH env provided,
+  # "force": refresh assets/settings first, then run gitstrap if GH env provided,
   # then (optionally) apply password if NEW/CONFIRM provided.
   force)
     ensure_assets_and_settings

@@ -6,6 +6,8 @@ services:
       PGID: "1000"
       TZ: "America/Toronto"
       FILE__HASHED_PASSWORD: "/config/.gitstrap/codepass.hash"
+      DOCKER_MODS: linuxserver/mods:universal-package-install
+      INSTALL_PACKAGES: argon2
       GH_USER: "${GH_USER}"
       GH_PAT: "${GH_PAT}"
       GIT_NAME: "${GIT_NAME}"

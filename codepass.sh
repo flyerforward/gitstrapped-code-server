@@ -94,22 +94,34 @@ JSON
 }
 
 docker_restart_self(){
-  # Requires: -v /var/run/docker.sock:/var/run/docker.sock (rw) and permission to read/write it.
+  # Requires: -v /var/run/docker.sock:/var/run/docker.sock (RW)
+  # And the container user must have permission on that socket.
   sock="${DOCKER_SOCK:-/var/run/docker.sock}"
   [ -S "$sock" ] || return 1
+
+  # Use curl to the Docker Engine API
   command -v curl >/dev/null 2>&1 || return 1
 
-  # Try to discover our container ID (works on cgroup v1/v2)
-  cid="$(grep -Eo '([0-9a-f]{64})' /proc/self/cgroup 2>/dev/null | head -n1 || true)"
-  if [ -z "${cid:-}" ] && [ -r /etc/hostname ]; then
-    hn="$(cat /etc/hostname 2>/dev/null || true)"
-    if echo "$hn" | grep -Eq '^[0-9a-f]{12,64}$'; then cid="$hn"; fi
+  # Prefer explicit container name if provided via env
+  self_name="${SELF_CONTAINER_NAME:-}"
+  if [ -n "$self_name" ]; then
+    code="$(curl --unix-socket "$sock" -s -o /dev/null -w '%{http_code}' \
+      -X POST "http://localhost/v1.41/containers/${self_name}/restart")" || true
+    [ "$code" = "204" ] || [ "$code" = "304" ] && { log "requested docker restart for $self_name"; return 0; }
   fi
-  [ -n "${cid:-}" ] || return 1
 
-  code="$(curl --unix-socket "$sock" -s -o /dev/null -w '%{http_code}' -X POST "http://localhost/v1.41/containers/${cid}/restart")"
+  # Fallback: derive our container ID from cgroups/hostname
+  cid="$(grep -Eo '([0-9a-f]{64})' /proc/self/cgroup 2>/dev/null | head -n1 || true)"
+  if [ -z "$cid" ] && [ -r /etc/hostname ]; then
+    hn="$(cat /etc/hostname 2>/dev/null || true)"
+    echo "$hn" | grep -Eq '^[0-9a-f]{12,64}$' && cid="$hn" || true
+  fi
+  [ -n "$cid" ] || return 1
+
+  code="$(curl --unix-socket "$sock" -s -o /dev/null -w '%{http_code}' \
+    -X POST "http://localhost/v1.41/containers/${cid}/restart")" || true
   if [ "$code" = "204" ] || [ "$code" = "304" ]; then
-    log "requested docker restart via docker.sock for container $cid"
+    log "requested docker restart for container $cid"
     return 0
   fi
   return 1
@@ -118,24 +130,22 @@ docker_restart_self(){
 restart_container(){
   log "requesting supervised shutdown so Docker restarts the container..."
 
-  # s6-overlay v3 (LinuxServer.io images)
+  # 1) Try s6 supervisor (usually needs root; harmless if denied)
   if command -v s6-svscanctl >/dev/null 2>&1; then
     for dir in /run/service /run/s6/services /run/s6; do
-      if [ -d "$dir" ]; then
-        if s6-svscanctl -t "$dir" 2>/dev/null; then
-          log "signalled s6 supervisor at $dir"
-          exit 0
-        fi
+      if [ -d "$dir" ] && s6-svscanctl -t "$dir" 2>/dev/null; then
+        log "signalled s6 supervisor at $dir"
+        exit 0
       fi
     done
   fi
 
-  # Try Docker API via unix socket (non-root user if socket is accessible)
+  # 2) Try Docker Engine API via /var/run/docker.sock (works for UID 1000 if granted)
   if docker_restart_self; then
     exit 0
   fi
 
-  # Last resort (may require root; likely to fail under PUID 1000)
+  # 3) Last resort (likely blocked for non-root)
   if kill -TERM 1 2>/dev/null; then
     log "sent TERM to PID 1"
     exit 0

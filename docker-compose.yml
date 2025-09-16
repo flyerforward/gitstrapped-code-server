@@ -1,26 +1,38 @@
 services:
   code:
     image: lscr.io/linuxserver/code-server:4.101.1
+    container_name: code-server
     environment:
       PUID: "1000"
       PGID: "1000"
       TZ: "America/Toronto"
+
+      # Read login password from this file at container (re)start
       FILE__PASSWORD: "/config/.gitstrap/codepass.txt"
+
+      # Let the password task know what to restart via Docker API
+      SELF_CONTAINER_NAME: "code-server"
+
+      # Git bootstrap envs (optional for autorun; otherwise use the Ctrl+Alt+G task)
       GH_USER: "${GH_USER}"
       GH_PAT: "${GH_PAT}"
       GIT_NAME: "${GIT_NAME}"
       GIT_EMAIL: "${GIT_EMAIL}"
       GIT_REPOS: "${GIT_REPOS}"
       GIT_BASE_DIR: "/config/workspace"
+
     volumes:
-      - code-config:/config1234
+      - /var/run/docker.sock:/var/run/docker.sock           # allow self-restart via Docker API
       - code-config:/config
       - projects:/config/workspace
+      - ./dockersock-group.sh:/custom-cont-init.d/01-dockersock-group.sh:ro  # <-- auto map socket GID
       - ./settings.json:/config/gitstrap/settings.json:ro
       - ./gitstrap.sh:/custom-cont-init.d/10-gitstrap.sh:ro
       - ./codepass.sh:/custom-cont-init.d/20-codepass.sh:ro
+
     ports:
-      - ":8443"
+      - ":8443"   # map as you like, e.g. "8443:8443"
+
     restart: always
 
 volumes:

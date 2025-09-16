@@ -5,7 +5,7 @@ services:
       PUID: "1000"
       PGID: "1000"
       TZ: "America/Toronto"
-      FILE__PASSWORD: "/config/.gitstrap/codepass.txt"
+      FILE__HASHED_PASSWORD: "/config/.gitstrap/codepass.hash"
       GH_USER: "${GH_USER}"
       GH_PAT: "${GH_PAT}"
       GIT_NAME: "${GIT_NAME}"

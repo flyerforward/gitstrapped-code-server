@@ -1,7 +1,7 @@
 services:
   code:
     image: lscr.io/linuxserver/code-server:4.101.1
-    container_name: code-server
+    # no container_name => compose DNS works best
     environment:
       PUID: "1000"
       PGID: "1000"
@@ -25,67 +25,70 @@ services:
       - ./gitstrap.sh:/custom-cont-init.d/10-gitstrap.sh:ro
       - ./codepass.sh:/custom-cont-init.d/20-codepass.sh:ro
 
+    # Dokploy often uses ":8443". Keep your current mapping style.
     ports:
-      - ":8443"   # or "8443:8443"
-
-    # Allow calling the sidecar via host.docker.internal
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - ":8443"
 
     restart: always
-    networks:
-      appnet: {}
+    # (no explicit networks => both services share the default project network)
 
   restartd:
     image: alpine:3.20
-    container_name: code-server-restartd
-    user: "0:0"
+    # no container_name => service DNS = "restartd"
+    user: "0:0"            # needs access to /var/run/docker.sock
     depends_on:
       - code
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    # Expose to the host so the code container can always hit it via host.docker.internal:19000
-    ports:
-      - "19000:9000"
+    # no ports: we only want internal traffic on the default network
     command:
       - /bin/sh
       - -ceu
       - |
         apk add --no-cache curl socat >/dev/null
+        # Small HTTP hook; only /restart triggers a restart
         cat >/usr/local/bin/restart-hook <<'EOF'
-#!/usr/bin/env sh
-# read request line
-IFS= read -r req || req=""
-# eat headers
-while IFS= read -r line; do [ -z "$line" ] && break; done
-# log request
-echo "[restartd] request: ${req}" >&2
-# route: only /restart triggers a restart; /health is no-op
-case "$req" in
-  *" /restart "*) action=restart ;;
-  *" /health "*)  action=health  ;;
-  *)              action=noop    ;;
-esac
-# respond quickly
-printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
-# background restart so response returns immediately
-if [ "$action" = restart ]; then
-  curl --unix-socket /var/run/docker.sock -s -o /dev/null \
-    -X POST http://localhost/v1.41/containers/code-server/restart >/dev/null 2>&1 &
-fi
-EOF
+        #!/usr/bin/env sh
+        # read request line
+        IFS= read -r req || req=""
+        # eat headers
+        while IFS= read -r line; do [ -z "$line" ] && break; done
+        # log the request line once
+        echo "[restartd] request: ${req}" >&2
+
+        # route: only /restart triggers a restart; /health is no-op
+        case "$req" in
+          *" /restart "*) action=restart ;;
+          *" /health "*)  action=health  ;;
+          *)              action=noop    ;;
+        esac
+
+        # respond quickly
+        printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+
+        # If restart requested, find the code container by compose label and restart it
+        if [ "$action" = restart ]; then
+          # Find the first container with label com.docker.compose.service=code
+          cid="$(
+            curl --unix-socket /var/run/docker.sock -s \
+              "http://localhost/v1.41/containers/json?filters=%7B%22label%22%3A%5B%22com.docker.compose.service%3Dcode%22%5D%7D" \
+            | sed -n 's/.*"Id":"\([0-9a-f]\{64\}\)".*/\1/p' | head -n1
+          )"
+          if [ -n "$cid" ]; then
+            curl --unix-socket /var/run/docker.sock -s -o /dev/null \
+              -X POST "http://localhost/v1.41/containers/${cid}/restart" || true
+            echo "[restartd] restarted container $cid" >&2
+          else
+            echo "[restartd] WARN: could not find container with label com.docker.compose.service=code" >&2
+          fi
+        fi
+        EOF
         chmod +x /usr/local/bin/restart-hook
         echo "[restartd] listening on :9000 (/restart to restart, /health no-op)"
-        # IMPORTANT: run via sh so heredoc indentation can't break the shebang
-        exec socat TCP-LISTEN:9000,reuseaddr,fork,keepalive,crlf \
-          EXEC:"/bin/sh /usr/local/bin/restart-hook",setsid,pty,stderr
+        # Keep it minimal; suppress Broken pipe spam by not logging socket errors
+        exec socat -T10 TCP-LISTEN:9000,reuseaddr,fork,keepalive,crlf \
+          EXEC:"/bin/sh /usr/local/bin/restart-hook",setsid,pty,stderr=0
     restart: always
-    networks:
-      appnet: {}
-
-networks:
-  appnet:
-    name: codeserver_appnet
 
 volumes:
   code-config:

@@ -1,16 +1,16 @@
 services:
   code:
     image: lscr.io/linuxserver/code-server:4.101.1
-    # no container_name => compose DNS works best
+    # keep/no container_name (either is fine)
     environment:
       PUID: "1000"
       PGID: "1000"
       TZ: "America/Toronto"
 
-      # Read login password from this file on container (re)start
+      # code-server reads this on container (re)start
       FILE__PASSWORD: "/config/.gitstrap/codepass.txt"
 
-      # Optional: used by your gitstrap bootstrap flow
+      # optional gitstrap envs
       GH_USER: "${GH_USER}"
       GH_PAT: "${GH_PAT}"
       GIT_NAME: "${GIT_NAME}"
@@ -19,57 +19,52 @@ services:
       GIT_BASE_DIR: "/config/workspace"
 
     volumes:
-      - code-config:/config1
+      - code-config:/config09
       - code-config:/config
       - projects:/config/workspace
       - ./settings.json:/config/gitstrap/settings.json:ro
       - ./gitstrap.sh:/custom-cont-init.d/10-gitstrap.sh:ro
       - ./codepass.sh:/custom-cont-init.d/20-codepass.sh:ro
 
-    # Dokploy often uses ":8443". Keep your current mapping style.
+    # Dokploy-style port publication (keep as you had it)
     ports:
       - ":8443"
 
     restart: always
-    # (no explicit networks => both services share the default project network)
 
   restartd:
     image: alpine:3.20
-    # no container_name => service DNS = "restartd"
-    user: "0:0"            # needs access to /var/run/docker.sock
+    user: "0:0"                         # needs access to docker.sock
     depends_on:
       - code
+    # CRUCIAL: share the network namespace with "code"
+    network_mode: "service:code"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    # no ports: we only want internal traffic on the default network
     command:
       - /bin/sh
       - -ceu
       - |
         apk add --no-cache curl socat >/dev/null
-        # Small HTTP hook; only /restart triggers a restart
         cat >/usr/local/bin/restart-hook <<'EOF'
         #!/usr/bin/env sh
         # read request line
         IFS= read -r req || req=""
         # eat headers
         while IFS= read -r line; do [ -z "$line" ] && break; done
-        # log the request line once
+        # log once
         echo "[restartd] request: ${req}" >&2
-
         # route: only /restart triggers a restart; /health is no-op
         case "$req" in
           *" /restart "*) action=restart ;;
           *" /health "*)  action=health  ;;
           *)              action=noop    ;;
         esac
-
         # respond quickly
         printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
-
-        # If restart requested, find the code container by compose label and restart it
+        # background restart so response returns immediately
         if [ "$action" = restart ]; then
-          # Find the first container with label com.docker.compose.service=code
+          # find the "code" service container by compose label and restart it
           cid="$(
             curl --unix-socket /var/run/docker.sock -s \
               "http://localhost/v1.41/containers/json?filters=%7B%22label%22%3A%5B%22com.docker.compose.service%3Dcode%22%5D%7D" \
@@ -85,9 +80,9 @@ services:
         fi
         EOF
         chmod +x /usr/local/bin/restart-hook
-        echo "[restartd] listening on :9000 (/restart to restart, /health no-op)"
-        # Keep it minimal; suppress Broken pipe spam by not logging socket errors
-        exec socat -T10 TCP-LISTEN:9000,reuseaddr,fork,keepalive,crlf \
+        echo "[restartd] listening on 127.0.0.1:9000 (/restart to restart, /health no-op)"
+        # listen inside the shared netns; suppress socket noise
+        exec socat -T10 TCP-LISTEN:9000,bind=127.0.0.1,reuseaddr,fork,keepalive,crlf \
           EXEC:"/bin/sh /usr/local/bin/restart-hook",setsid,pty,stderr=0
     restart: always
 

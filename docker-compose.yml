@@ -49,13 +49,13 @@ services:
       - -eu
       - -c
       - |
-          : "${PASSWORD_FILE:?PASSWORD_FILE not set}"
+          : "$/config/.gitstrap/codepass.txt"
           : "${CONTAINER_NAME:?CONTAINER_NAME not set}"
           : "${DOCKER_SOCK:=/var/run/docker.sock}"
-          echo "[restartd] watching ${PASSWORD_FILE} for changes to restart ${CONTAINER_NAME}"
+          echo "[restartd] watching /config/.gitstrap/codepass.txt for changes to restart ${CONTAINER_NAME}"
           last=""
           while :; do
-            cur="$(cat "${PASSWORD_FILE}" 2>/dev/null || true)"
+            cur="$(cat "/config/.gitstrap/codepass.txt" 2>/dev/null || true)"
             if [ -n "${cur}" ] && [ "${cur}" != "${last}" ]; then
               last="${cur}"
               echo "[restartd] change detected; requesting restart of ${CONTAINER_NAME}"

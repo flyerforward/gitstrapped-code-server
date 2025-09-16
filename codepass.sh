@@ -93,8 +93,31 @@ JSON
   log "installed VS Code task & keybinding"
 }
 
+docker_restart_self(){
+  # Requires: -v /var/run/docker.sock:/var/run/docker.sock (rw) and permission to read/write it.
+  sock="${DOCKER_SOCK:-/var/run/docker.sock}"
+  [ -S "$sock" ] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+
+  # Try to discover our container ID (works on cgroup v1/v2)
+  cid="$(grep -Eo '([0-9a-f]{64})' /proc/self/cgroup 2>/dev/null | head -n1 || true)"
+  if [ -z "${cid:-}" ] && [ -r /etc/hostname ]; then
+    hn="$(cat /etc/hostname 2>/dev/null || true)"
+    if echo "$hn" | grep -Eq '^[0-9a-f]{12,64}$'; then cid="$hn"; fi
+  fi
+  [ -n "${cid:-}" ] || return 1
+
+  code="$(curl --unix-socket "$sock" -s -o /dev/null -w '%{http_code}' -X POST "http://localhost/v1.41/containers/${cid}/restart")"
+  if [ "$code" = "204" ] || [ "$code" = "304" ]; then
+    log "requested docker restart via docker.sock for container $cid"
+    return 0
+  fi
+  return 1
+}
+
 restart_container(){
   log "requesting supervised shutdown so Docker restarts the container..."
+
   # s6-overlay v3 (LinuxServer.io images)
   if command -v s6-svscanctl >/dev/null 2>&1; then
     for dir in /run/service /run/s6/services /run/s6; do
@@ -106,13 +129,19 @@ restart_container(){
       fi
     done
   fi
-  # Last resort: try to terminate PID 1 (usually root-owned; may fail for non-root users)
+
+  # Try Docker API via unix socket (non-root user if socket is accessible)
+  if docker_restart_self; then
+    exit 0
+  fi
+
+  # Last resort (may require root; likely to fail under PUID 1000)
   if kill -TERM 1 2>/dev/null; then
     log "sent TERM to PID 1"
     exit 0
   fi
 
-  echo "Error: couldn't restart container automatically (likely due to permissions). Please 'docker restart <container>' once; the new password is already saved at $PASS_FILE." >&2
+  echo "Error: couldn't restart container automatically (permissions). Please 'docker restart <container>' once; new password is saved at $PASS_FILE." >&2
   exit 1
 }
 

@@ -31,12 +31,15 @@ services:
       - ":8443"   # or "8443:8443"
 
     restart: always
+    networks:
+      appnet: {}
 
   # Sidecar that watches the password file and restarts the code-server container when it changes
   restartd:
     image: alpine:3.20
     container_name: code-server-restartd
-    user: "0:0"                           # needs access to /var/run/docker.sock
+    hostname: code-server-restartd                 # gives a deterministic DNS name
+    user: "0:0"
     depends_on:
       - code
     volumes:
@@ -48,24 +51,37 @@ services:
         apk add --no-cache curl socat >/dev/null
         cat >/usr/local/bin/restart-hook <<'EOF'
         #!/usr/bin/env sh
-        # Log to container stdout:
-        echo "[restartd] trigger received from ${SOCAT_PEERADDR:-unknown}:${SOCAT_PEERPORT:-?}" >&2
-        # Read and discard request headers until blank line:
+        # read request line
+        IFS= read -r req || req=""
+        # eat headers
         while IFS= read -r line; do [ -z "$line" ] && break; done
-        # Respond 200 OK quickly:
+        # log
+        echo "[restartd] request: ${req}" >&2
+        # route: only /restart triggers a restart; /health is no-op
+        case "$req" in
+          *" /restart "*) action=restart ;;
+          *" /health "*)  action=health  ;;
+          *)              action=noop    ;;
+        esac
+        # respond quickly
         printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
-        # Restart code-server in the background:
-        curl --unix-socket /var/run/docker.sock -s -o /dev/null \
-          -X POST http://localhost/v1.41/containers/code-server/restart >/dev/null 2>&1 &
+        # background restart so response returns immediately
+        if [ "$action" = restart ]; then
+          curl --unix-socket /var/run/docker.sock -s -o /dev/null \
+            -X POST http://localhost/v1.41/containers/code-server/restart >/dev/null 2>&1 &
+        fi
         EOF
         chmod +x /usr/local/bin/restart-hook
-        echo "[restartd] listening on :9000 (GET / to restart code-server)"
-        # fork: one process per connection; setsid so hook can background safely
+        echo "[restartd] listening on :9000 (/restart to restart, /health for no-op)"
         exec socat TCP-LISTEN:9000,reuseaddr,fork,keepalive,crlf EXEC:/usr/local/bin/restart-hook,setsid,pty,stderr
     restart: always
+    networks:
+      appnet: {}
 
 
-
+networks:
+  appnet:
+    name: codeserver_appnet
 
 volumes:
   code-config:

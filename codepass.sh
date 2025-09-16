@@ -91,19 +91,23 @@ JSON
 }
 
 trigger_restart_hook(){
-  # Use the Compose service name: "restartd" (NOT the container_name)
-  URL="http://restartd:9000/"
+  try() {
+    url="$1"
+    curl -fsS --max-time 3 "$url" >/dev/null 2>&1
+  }
   if command -v curl >/dev/null 2>&1; then
-    if out="$(curl -fsS --max-time 3 "$URL" 2>&1)"; then
-      log "restart sidecar responded: $(printf %s "$out" | tr -d '\n' | head -c 80)"
+    if   try "http://restartd:9000/restart"; then
+      log "restart sidecar responded at restartd:9000/restart"
+    elif try "http://code-server-restartd:9000/restart"; then
+      log "restart sidecar responded at code-server-restartd:9000/restart"
     else
-      code=$?
-      log "WARN: restart trigger failed (curl exit $code) → URL=$URL ; details: $out"
+      log "WARN: restart trigger failed via DNS; please check compose network"
     fi
   else
-    log "curl not found; please restart container manually"
+    log "curl not found; please restart the container manually"
   fi
 }
+
 
 
 write_password_and_exit_ok(){

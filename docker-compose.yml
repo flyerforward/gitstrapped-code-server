@@ -53,27 +53,27 @@ services:
       - |
         apk add --no-cache curl socat >/dev/null
         cat >/usr/local/bin/restart-hook <<'EOF'
-        #!/usr/bin/env sh
-        # read request line
-        IFS= read -r req || req=""
-        # eat headers
-        while IFS= read -r line; do [ -z "$line" ] && break; done
-        # log request
-        echo "[restartd] request: ${req}" >&2
-        # route: only /restart triggers a restart; /health is no-op
-        case "$req" in
-          *" /restart "*) action=restart ;;
-          *" /health "*)  action=health  ;;
-          *)              action=noop    ;;
-        esac
-        # respond quickly
-        printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
-        # background restart so response returns immediately
-        if [ "$action" = restart ]; then
-          curl --unix-socket /var/run/docker.sock -s -o /dev/null \
-            -X POST http://localhost/v1.41/containers/code-server/restart >/dev/null 2>&1 &
-        fi
-        EOF
+#!/usr/bin/env sh
+# read request line
+IFS= read -r req || req=""
+# eat headers
+while IFS= read -r line; do [ -z "$line" ] && break; done
+# log request
+echo "[restartd] request: ${req}" >&2
+# route: only /restart triggers a restart; /health is no-op
+case "$req" in
+  *" /restart "*) action=restart ;;
+  *" /health "*)  action=health  ;;
+  *)              action=noop    ;;
+esac
+# respond quickly
+printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+# background restart so response returns immediately
+if [ "$action" = restart ]; then
+  curl --unix-socket /var/run/docker.sock -s -o /dev/null \
+    -X POST http://localhost/v1.41/containers/code-server/restart >/dev/null 2>&1 &
+fi
+EOF
         chmod +x /usr/local/bin/restart-hook
         echo "[restartd] listening on :9000 (/restart to restart, /health no-op)"
         # IMPORTANT: run via sh so heredoc indentation can't break the shebang

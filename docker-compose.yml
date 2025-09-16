@@ -36,29 +36,31 @@ services:
   restartd:
     image: alpine:3.20
     container_name: code-server-restartd
-    user: "0:0"   # root so it can talk to /var/run/docker.sock
+    user: "0:0"                             # needs access to /var/run/docker.sock
     depends_on:
       - code
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    command: >
-      sh -eu -c '
-        apk add --no-cache curl busybox-extras >/dev/null;
-        mkdir -p /www/cgi-bin;
-        cat >/www/cgi-bin/restart << "EOF"
+    command:
+      - /bin/sh
+      - -ceu
+      - |
+        apk add --no-cache curl socat >/dev/null
+        cat >/usr/local/bin/restart-hook <<'EOF'
         #!/usr/bin/env sh
-        echo "Status: 200 OK"
-        echo "Content-Type: text/plain"
-        echo
-        echo OK
-        curl --unix-socket /var/run/docker.sock -s -o /dev/null -w "[restartd] docker api returned %{http_code}\n" \
-          -X POST http://localhost/v1.41/containers/code-server/restart || true
+        # read and discard the HTTP request headers until blank line
+        while IFS= read -r line; do [ -z "$line" ] && break; done
+        # respond immediately
+        printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+        # do the restart in the background (so the client returns fast)
+        curl --unix-socket /var/run/docker.sock -s -o /dev/null \
+          -X POST http://localhost/v1.41/containers/code-server/restart >/dev/null 2>&1 &
         EOF
-        chmod +x /www/cgi-bin/restart
-        echo "[restartd] listening on :9000 (GET /cgi-bin/restart to restart code-server)"
-        exec busybox httpd -f -p 0.0.0.0:9000 -h /www
-      '
+        chmod +x /usr/local/bin/restart-hook
+        echo "[restartd] listening on :9000 (GET / to restart code-server)"
+        exec socat TCP-LISTEN:9000,reuseaddr,fork,keepalive EXEC:/usr/local/bin/restart-hook,setsid
     restart: always
+
 
 
 volumes:

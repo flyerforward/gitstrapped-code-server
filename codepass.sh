@@ -92,12 +92,13 @@ JSON
 
 trigger_restart_hook(){
   if command -v curl >/dev/null 2>&1; then
-    curl -fsS --max-time 2 http://code-server-restartd:9000/cgi-bin/restart >/dev/null 2>&1 || true
-    log "sent restart trigger to sidecar (GET /cgi-bin/restart)"
+    curl -fsS --max-time 2 http://code-server-restartd:9000/ >/dev/null 2>&1 || true
+    log "sent restart trigger to sidecar (GET /)"
   else
     log "curl not found; please restart the container manually"
   fi
 }
+
 
 write_password_and_exit_ok(){
   NEW="${1:-}"

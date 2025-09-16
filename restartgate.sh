@@ -13,7 +13,7 @@ if [ -z "${NODE_BIN:-}" ]; then
 fi
 log "using node at: $NODE_BIN"
 
-# Write the tiny HTTP server
+# Tiny HTTP server
 mkdir -p /usr/local/bin
 cat >/usr/local/bin/restartgate.js <<'EOF'
 const http = require('http');
@@ -28,7 +28,6 @@ const srv = http.createServer((req, res) => {
   }
   if (url === '/restart') {
     res.writeHead(200, {'Content-Type':'text/plain'}); res.end('OK');
-    // Ask s6 to exit; Docker (restart: always) will bring the container back up
     exec('s6-svscanctl -t /run/s6 || kill -TERM 1', () => {});
     return;
   }
@@ -43,9 +42,19 @@ chmod 755 /usr/local/bin/restartgate.js
 
 # s6 service to run the server
 mkdir -p /etc/services.d/restartgate
-cat >/etc/services.d/restartgate/run <<EOF
+cat >/etc/services.d/restartgate/run <<'EOF'
 #!/usr/bin/env sh
-exec "$NODE_BIN" /usr/local/bin/restartgate.js
+MARKER="/config/.gitstrap/.firstboot-auth-restart"
+
+# If a first-boot restart was queued, schedule it and remove the marker
+if [ -f "$MARKER" ]; then
+  echo "[restartgate] first-boot marker found; scheduling immediate supervised restart"
+  rm -f "$MARKER" || true
+  ( sleep 1; s6-svscanctl -t /run/s6 || kill -TERM 1 ) &
+fi
+
+# Start the HTTP gate
+exec /app/code-server/lib/node /usr/local/bin/restartgate.js
 EOF
 chmod +x /etc/services.d/restartgate/run
 

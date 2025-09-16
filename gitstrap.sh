@@ -172,6 +172,10 @@ apply_password_hash(){
   size="$(wc -c < "$PASS_HASH_PATH" 2>/dev/null || echo 0)"
   head="$(cut -c1-22 < "$PASS_HASH_PATH" 2>/dev/null || true)"
   log "hashed password saved to $PASS_HASH_PATH (utc=$ts bytes=$size head=${head}...)"
+
+  # ===== big visible banner =====
+  printf "\n\033[1;33m*** CODE-SERVER PASSWORD CHANGED ***\n*** REFRESH PAGE TO LOGIN ***\033[0m\n\n"
+
   log "container will restart; code-server will read FILE__HASHED_PASSWORD."
   trigger_restart_gate
   return 0
@@ -197,6 +201,7 @@ install_user_assets(){
       "env": {
         "GH_USER": "${input:gh_user}",
         "GH_PAT": "${input:gh_pat}",
+        "GH_PAT_FALLBACK": "${env:GH_PAT}",
         "GIT_EMAIL": "${input:git_email}",
         "GIT_NAME": "${input:git_name}",
         "GIT_REPOS": "${input:git_repos}",
@@ -211,7 +216,7 @@ install_user_assets(){
 
   INPUTS_JSON='[
     { "__gitstrap_settings": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}", "gitstrap_preserve": [] },
-    { "__gitstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true, "gitstrap_preserve": [] },
+    { "__gitstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key). Leave blank to use env GH_PAT if set.", "password": true, "gitstrap_preserve": [] },
     { "__gitstrap_settings": true, "id": "git_email", "type": "promptString", "description": "Git email (optional; leave empty to auto-detect)", "default": "${env:GIT_EMAIL}", "gitstrap_preserve": [] },
     { "__gitstrap_settings": true, "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}", "gitstrap_preserve": [] },
     { "__gitstrap_settings": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}", "gitstrap_preserve": [] },
@@ -223,13 +228,6 @@ install_user_assets(){
   KB_G='{
     "__gitstrap_settings": true,
     "key": "ctrl+alt+g",
-    "command": "workbench.action.tasks.runTask",
-    "args": "Bootstrap GitHub Workspace",
-    "gitstrap_preserve": []
-  }'
-  KB_P='{
-    "__gitstrap_settings": true,
-    "key": "ctrl+alt+p",
     "command": "workbench.action.tasks.runTask",
     "args": "Bootstrap GitHub Workspace",
     "gitstrap_preserve": []
@@ -341,12 +339,12 @@ JSON
           )
       ' "$TASKS_PATH" > "$tmp_tasks2" && mv -f "$tmp_tasks2" "$TASKS_PATH"
 
-    # ---- keybindings.json upsert (two bindings map to same task) + remove old password binding
+    # ---- keybindings.json upsert (only Ctrl+Alt+G) + remove old password binding if present
     tmp_kb="$(mktemp_in_dir "$KEYB_PATH")"
     if [ -f "$KEYB_PATH" ] && jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
       jq \
         --arg flag "$GITSTRAP_FLAG" \
-        --argjson newkbs "[$KB_G, $KB_P]" '
+        --argjson nk "$KB_G" '
           def ensureArr(a): if (a|type)=="array" then a else [] end;
           def merge_with_preserve($old; $incoming; $flag):
             ($incoming + {($flag): true})
@@ -366,25 +364,25 @@ JSON
               then empty else . end
             )) as $clean
 
-          # upsert by (command,args,key)
-          | reduce $newkbs[] as $nk (
-              $clean;
-              if any(.[]?; (type=="object")
-                           and (.command? // "")==($nk.command // "")
-                           and (.args? // "")==($nk.args // "")
-                           and (.key? // "")==($nk.key // "")) then
-                map( if ( (type=="object")
-                          and (.command? // "")==($nk.command // "")
-                          and (.args? // "")==($nk.args // "")
-                          and (.key? // "")==($nk.key // "") )
-                     then ( if ((.[$flag]? // false)==true) then merge_with_preserve(.; $nk; $flag) else $nk end )
-                     else . end )
-              else . + [ $nk ] end
-            )
-          | . + $nonobjs
+          # upsert Ctrl+Alt+G binding by (command,args,key)
+          | ( if any($clean[]?; (type=="object")
+                                and (.command? // "")==($nk.command // "")
+                                and (.args? // "")==($nk.args // "")
+                                and (.key? // "")==($nk.key // "")) then
+                ( $clean | map(
+                    if ( (type=="object")
+                         and (.command? // "")==($nk.command // "")
+                         and (.args? // "")==($nk.args // "")
+                         and (.key? // "")==($nk.key // "") )
+                    then ( if ((.[$flag]? // false)==true) then merge_with_preserve(.; $nk; $flag) else $nk end )
+                    else . end ))
+              else
+                $clean + [ $nk ]
+              end
+            ) + $nonobjs
         ' "$KEYB_PATH" > "$tmp_kb" && mv -f "$tmp_kb" "$KEYB_PATH"
     else
-      printf '[%s,%s]\n' "$KB_G" "$KB_P" > "$KEYB_PATH"
+      printf '[%s]\n' "$KB_G" > "$KEYB_PATH"
     fi
   else
     # no jq → create-only
@@ -396,7 +394,7 @@ JSON
 }
 JSON
 )" > "$TASKS_PATH"
-    [ -f "$KEYB_PATH" ] || printf '[%s,%s]\n' "$KB_G" "$KB_P" > "$KEYB_PATH"
+    [ -f "$KEYB_PATH" ] || printf '[%s]\n' "$KB_G" > "$KEYB_PATH"
   fi
 
   chown "$PUID:$PGID" "$TASKS_PATH" "$KEYB_PATH" 2>/dev/null || true
@@ -595,6 +593,13 @@ autorun_or_hint(){
   fi
 }
 
+# Coalesce runtime envs from task (let empty PAT fall back to container env)
+resolve_task_env_fallbacks(){
+  if [ -z "${GH_PAT:-}" ] && [ -n "${GH_PAT_FALLBACK:-}" ]; then
+    export GH_PAT="$GH_PAT_FALLBACK"
+  fi
+}
+
 init_all(){
   install_restart_gate
   init_default_password
@@ -614,8 +619,9 @@ case "${1:-init}" in
     init_all
     ;;
   force)
-    # Merge assets/settings before the run so VS Code prompts appear as expected
+    # Merge assets/settings first so prompts show correctly, then coalesce envs.
     ensure_assets_and_settings
+    resolve_task_env_fallbacks
     if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ]; then
       do_gitstrap
     else

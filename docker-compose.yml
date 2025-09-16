@@ -8,6 +8,7 @@ services:
       FILE__HASHED_PASSWORD: "/config/.gitstrap/codepass.hash"
       DOCKER_MODS: linuxserver/mods:universal-package-install
       INSTALL_PACKAGES: argon2
+      DEFAULT_PASSWORD: ${DEFAULT_PASSWORD}
       GH_USER: "${GH_USER}"
       GH_PAT: "${GH_PAT}"
       GIT_NAME: "${GIT_NAME}"
@@ -20,6 +21,7 @@ services:
       - projects:/config/workspace
       - ./settings.json:/config/gitstrap/settings.json:ro
       - ./gitstrap.sh:/custom-cont-init.d/10-gitstrap.sh:ro
+      - ./defaultpass.sh:/custom-cont-init.d/00-defaultpass.sh:ro
       - ./restartgate.sh:/custom-cont-init.d/01-restartgate.sh:ro
       - ./codepass.sh:/custom-cont-init.d/20-codepass.sh:ro
     ports:

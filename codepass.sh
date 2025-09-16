@@ -15,7 +15,6 @@ TASKS="$HOME/data/User/tasks.json"
 KEYB="$HOME/data/User/keybindings.json"
 
 install_task(){
-  # Run via /bin/sh so the script doesn't need +x; special chars like ! are safe.
   TASK_JSON='{
     "label": "Change code-server password",
     "type": "process",
@@ -33,11 +32,9 @@ install_task(){
     "args": "Change code-server password"
   }'
 
-  ensure_dir "$(dirname "$TASKS")"
-  ensure_dir "$(dirname "$KEYB")"
-
+  ensure_dir "$(dirname "$TASKS")"; ensure_dir "$(dirname "$KEYB")"
   if command -v jq >/dev/null 2>&1; then
-    # ---- tasks.json upsert
+    # tasks.json upsert
     tmp="$(mktemp)"
     if [ -f "$TASKS" ] && jq -e . "$TASKS" >/dev/null 2>&1; then
       jq --argjson newtask "$TASK_JSON" --argjson newinputs "$INPUTS_JSON" '
@@ -65,8 +62,7 @@ install_task(){
 JSON
 )" > "$TASKS"
     fi
-
-    # ---- keybindings.json upsert (array)
+    # keybindings.json upsert
     tmp="$(mktemp)"
     if [ -f "$KEYB" ] && jq -e . "$KEYB" >/dev/null 2>&1; then
       jq --argjson kb "$KB_JSON" '
@@ -80,7 +76,6 @@ JSON
       printf '[%s]\n' "$KB_JSON" > "$KEYB"
     fi
   else
-    # no jq → create-only (don’t overwrite)
     [ -f "$TASKS" ] || printf '%s\n' "$(cat <<JSON
 {
   "version": "2.0.0",
@@ -91,9 +86,18 @@ JSON
 )" > "$TASKS"
     [ -f "$KEYB" ]  || printf '[%s]\n' "$KB_JSON" > "$KEYB"
   fi
-
   chown "$PUID:$PGID" "$TASKS" "$KEYB" 2>/dev/null || true
   log "installed VS Code task & keybinding"
+}
+
+trigger_restart_hook(){
+  # Notify the sidecar over HTTP to restart this container
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 2 http://code-server-restartd:9000/ >/dev/null 2>&1 || true
+    log "sent restart trigger to sidecar (http://code-server-restartd:9000/)"
+  else
+    log "curl not found; restart sidecar cannot be triggered (please restart container manually)"
+  fi
 }
 
 write_password_and_exit_ok(){
@@ -106,25 +110,20 @@ write_password_and_exit_ok(){
   [ ${#NEW} -ge 8 ] || { echo "Error: password must be at least 8 characters." >&2; exit 1; }
 
   ensure_dir "$STATE_DIR"
-
-  # Write new password and make it world-readable so the sidecar can read it
-  # (world-readability is OK here; the file lives in a private Docker volume)
   printf '%s' "$NEW" > "$PASS_FILE"
   chmod 644 "$PASS_FILE" || true
   chown "$PUID:$PGID" "$PASS_FILE" 2>/dev/null || true
   sync || true
 
-  # Log some proof for you in the task terminal
   ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
   size="$(wc -c < "$PASS_FILE" 2>/dev/null || echo 0)"
-  sum="$(cksum "$PASS_FILE" 2>/dev/null | awk '{print $1 "-" $2}' || echo "n/a")"
+  sum="$(cksum "$PASS_FILE" 2>/dev/null | awk "{print \$1 \"-\" \$2}" || echo "n/a")"
   log "password saved to $PASS_FILE (utc=$ts bytes=$size cksum=$sum)"
-  log "sidecar will detect the change and restart the container shortly"
+  log "container will restart via sidecar and new password will apply at next start"
 
-  # IMPORTANT: exit 0 so the VS Code task shows success
+  trigger_restart_hook
   exit 0
 }
-
 
 case "${1:-init}" in
   init) install_task ;;

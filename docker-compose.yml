@@ -34,39 +34,29 @@ services:
 
   # Sidecar that watches the password file and restarts the code-server container when it changes
   restartd:
-    image: curlimages/curl:8.8.0
+    image: alpine:3.20
     container_name: code-server-restartd
-    user: "0:0"                                  # ensure it can read the file regardless of perms
+    user: "0:0"
     depends_on:
       - code
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock     # RW to call Docker API
-      - code-config:/config:ro                        # read the same /config volume
-    command:
-      - /bin/sh
-      - -eu
-      - -c
-      - |
-          file="/config/.gitstrap/codepass.txt"
-          name="code-server"
-          echo "[restartd] watching ${file} for changes to restart ${name}"
-          last=""
-          while :; do
-            if [ ! -f "$file" ]; then
-              echo "[restartd] NOTE: ${file} not found yet"; sleep 2; continue
-            fi
-            # CRC + size is portable and avoids stat flags differences
-            cur="$(cksum "$file" 2>/dev/null | awk '{print $1 "-" $2}' || true)"
-            if [ -n "$cur" ] && [ "$cur" != "$last" ]; then
-              last="$cur"
-              echo "[restartd] change detected (cksum=$cur); requesting restart of ${name}"
-              code="$(curl --unix-socket /var/run/docker.sock -s -o /dev/null -w '%{http_code}' \
-                -X POST "http://localhost/v1.41/containers/${name}/restart" || true)"
-              echo "[restartd] docker api returned ${code}"
-            fi
-            sleep 2
-          done
+      - /var/run/docker.sock:/var/run/docker.sock         # RW: restart via Docker API
+    command: >
+      sh -eu -c '
+        apk add --no-cache curl busybox-extras >/dev/null;
+        echo "[restartd] HTTP trigger listening on :9000 (GET /)";
+        while :; do
+          # serve one request and immediately restart the code-server container
+          # respond "OK" to the client so the task finishes fast
+          { printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"; } \
+            | nc -l -p 9000 -q 0 >/dev/null 2>&1 || true;
+          echo "[restartd] trigger received -> restarting code-server";
+          curl --unix-socket /var/run/docker.sock -s -o /dev/null -w "[restartd] docker api returned %{http_code}\n" \
+            -X POST http://localhost/v1.41/containers/code-server/restart || true;
+        done
+      '
     restart: always
+
 
 volumes:
   code-config:

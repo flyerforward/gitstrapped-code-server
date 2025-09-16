@@ -256,11 +256,11 @@ install_user_assets(){
         --argjson task "$GITSTRAP_TASK" '
           def ensureObj(o): if (o|type)=="object" then o else {} end;
           def ensureArr(a): if (a|type)=="array"  then a else [] end;
-          def merge_with_preserve($old; $incoming; $flag){
+          def merge_with_preserve($old; $incoming; $flag):
             ($incoming + {($flag): true})
             | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
             | ( reduce (($old.gitstrap_preserve // [])[]) as $k (. ; .[$k] = ($old[$k] // .[$k]) ) )
-          };
+          ;
 
           (ensureObj(.)) as $root
           | ($root.tasks // []) as $tasks_raw
@@ -306,11 +306,11 @@ JSON
       --arg flag "$GITSTRAP_FLAG" \
       --argjson newinputs "$INPUTS_JSON" '
         def ensureArr(a): if (a|type)=="array" then a else [] end;
-        def merge_with_preserve($old; $incoming; $flag){
+        def merge_with_preserve($old; $incoming; $flag):
           ($incoming + {($flag): true})
           | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
           | ( reduce (($old.gitstrap_preserve // [])[]) as $k (. ; .[$k] = ($old[$k] // .[$k]) ) )
-        };
+        ;
 
         (.inputs // []) as $cur_raw
         | (ensureArr($cur_raw)) as $cur
@@ -348,11 +348,11 @@ JSON
         --arg flag "$GITSTRAP_FLAG" \
         --argjson newkbs "[$KB_G, $KB_P]" '
           def ensureArr(a): if (a|type)=="array" then a else [] end;
-          def merge_with_preserve($old; $incoming; $flag){
+          def merge_with_preserve($old; $incoming; $flag):
             ($incoming + {($flag): true})
             | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
             | ( reduce (($old.gitstrap_preserve // [])[]) as $k (. ; .[$k] = ($old[$k] // .[$k]) ) )
-          };
+          ;
 
           (ensureArr(.)) as $arr
           | ($arr | map(select(type=="object"))) as $objs
@@ -399,7 +399,7 @@ JSON
     [ -f "$KEYB_PATH" ] || printf '[%s,%s]\n' "$KB_G" "$KB_P" > "$KEYB_PATH"
   fi
 
-  chown "$PUID:$PGID" "$TASKS_PATH" "$KEYB_PATH" 2>/div/null || true
+  chown "$PUID:$PGID" "$TASKS_PATH" "$KEYB_PATH" 2>/dev/null || true
   log "installed/merged single task, inputs, and keybindings"
 }
 

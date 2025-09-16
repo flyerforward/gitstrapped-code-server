@@ -67,42 +67,6 @@ services:
           done
     restart: always
 
-    image: curlimages/curl:8.8.0
-    container_name: code-server-restartd
-    user: "0:0"                                  # ensure it can read the file
-    depends_on:
-      - code
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - code-config:/config:ro
-    command:
-      - /bin/sh
-      - -eu
-      - -c
-      - |
-          file="/config/.gitstrap/codepass.txt"
-          echo "[restartd] watching ${file} for changes to restart code-server"
-          last_mtime=""
-          last_len=""
-          while :; do
-            # mtime + size -> detect change even if same contents are re-written
-            if [ -f "$file" ]; then
-              m="$(stat -c %Y "$file" 2>/dev/null || true)"
-              l="$(wc -c < "$file" 2>/dev/null || echo 0)"
-            else
-              m=""; l=""; 
-            fi
-            if [ -n "$m" ] && { [ "$m" != "$last_mtime" ] || [ "$l" != "$last_len" ]; }; then
-              last_mtime="$m"; last_len="$l"
-              echo "[restartd] change detected (mtime=$m, bytes=$l); requesting restart of code-server"
-              code="$(curl --unix-socket /var/run/docker.sock -s -o /dev/null -w '%{http_code}' \
-                -X POST http://localhost/v1.41/containers/code-server/restart || true)"
-              echo "[restartd] docker api returned $code"
-            fi
-            sleep 2
-          done
-    restart: always
-
 volumes:
   code-config:
   projects:

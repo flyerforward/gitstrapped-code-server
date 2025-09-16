@@ -107,7 +107,7 @@ write_password_and_exit_ok(){
 
   ensure_dir "$STATE_DIR"
   printf '%s' "$NEW" > "$PASS_FILE"
-  chmod 600 "$PASS_FILE" || true
+  chmod 644 "$PASS_FILE" || true
   chown "$PUID:$PGID" "$PASS_FILE" 2>/dev/null || true
 
   log "password saved to $PASS_FILE"

@@ -5,8 +5,23 @@ set -eu
 log(){ echo "[gitstrap] $*"; }
 warn(){ echo "[gitstrap][WARN] $*" >&2; }
 redact(){ echo "$1" | sed 's/[A-Za-z0-9_\-]\{12,\}/***REDACTED***/g'; }
-ensure_dir(){ mkdir -p "$1" 2>/dev/null || true; }
+
+# ensure_dir now also fixes ownership recursively
+ensure_dir(){
+  mkdir -p "$1" 2>/dev/null || true
+  chown -R "$PUID:$PGID" "$1" 2>/dev/null || true
+}
+
 write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1" 2>/dev/null || true; }
+
+# create a temp file in the same dir as the target to keep mv atomic (no cross-device copy)
+mktemp_in_dir(){
+  # usage: mktemp_in_dir /path/to/file.json
+  local dir base
+  dir="$(dirname "$1")"
+  base="$(basename "$1")"
+  mktemp "${dir}/${base}.XXXXXX"
+}
 
 # ========= env / paths =========
 export HOME="${HOME:-/config}"
@@ -211,19 +226,19 @@ install_user_assets(){
 
   # ----- normalize malformed keybindings.json → array
   if [ -f "$KEYB_PATH" ] && command -v jq >/dev/null 2>&1; then
-    tmp="$(mktemp)"
+    tmp="$(mktemp_in_dir "$KEYB_PATH")"
     if ! jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
-      cp "$KEYB_PATH" "$KEYB_PATH.bak"
+      cp "$KEYB_PATH" "$KEYB_PATH.bak" 2>/dev/null || true
       printf '[]' > "$KEYB_PATH"
     else
-      jq 'if type=="array" then . else [] end' "$KEYB_PATH" > "$tmp" && mv "$tmp" "$KEYB_PATH"
+      jq 'if type=="array" then . else [] end' "$KEYB_PATH" > "$tmp" && mv -f "$tmp" "$KEYB_PATH"
     fi
     chown "$PUID:$PGID" "$KEYB_PATH" 2>/dev/null || true
   fi
 
   if command -v jq >/dev/null 2>&1; then
     # ---- tasks.json upsert (multiple tasks + inputs) with preserve
-    tmp="$(mktemp)"
+    tmp_out="$(mktemp_in_dir "$TASKS_PATH")"
     if [ -f "$TASKS_PATH" ] && jq -e . "$TASKS_PATH" >/dev/null 2>&1; then
       jq \
         --arg flag "$GITSTRAP_FLAG" \
@@ -266,7 +281,7 @@ install_user_assets(){
                   end
                 )
             )
-        ' "$TASKS_PATH" > "$tmp" && mv "$tmp" "$TASKS_PATH"
+        ' "$TASKS_PATH" > "$tmp_out" && mv -f "$tmp_out" "$TASKS_PATH"
     else
       printf '%s\n' "$(cat <<JSON
 {
@@ -279,7 +294,7 @@ JSON
     fi
 
     # ---- keybindings.json upsert (two entries) with preserve
-    tmp="$(mktemp)"
+    tmp_out_kb="$(mktemp_in_dir "$KEYB_PATH")"
     if [ -f "$KEYB_PATH" ] && jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
       jq \
         --arg flag "$GITSTRAP_FLAG" \
@@ -299,7 +314,7 @@ JSON
                      else . end )
               else . + [ $nk ] end
             )
-        ' "$KEYB_PATH" > "$tmp" && mv "$tmp" "$KEYB_PATH"
+        ' "$KEYB_PATH" > "$tmp_out_kb" && mv -f "$tmp_out_kb" "$KEYB_PATH"
     else
       printf '[%s,%s]\n' "$KEYB_GITSTRAP" "$KEYB_CODEPASS" > "$KEYB_PATH"
     fi
@@ -342,10 +357,12 @@ install_settings_from_repo(){
 
   # ensure user settings is an object
   if [ -f "$SETTINGS_PATH" ]; then
+    tmp_norm="$(mktemp_in_dir "$SETTINGS_PATH")"
     if ! jq -e . "$SETTINGS_PATH" >/dev/null 2>&1; then
-      cp "$SETTINGS_PATH" "$SETTINGS_PATH.bak"; printf "{}" > "$SETTINGS_PATH"
+      cp "$SETTINGS_PATH" "$SETTINGS_PATH.bak" 2>/dev/null || true
+      printf "{}" > "$SETTINGS_PATH"
     else
-      tmp="$(mktemp)"; jq 'if type=="object" then . else {} end' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
+      jq 'if type=="object" then . else {} end' "$SETTINGS_PATH" > "$tmp_norm" && mv -f "$tmp_norm" "$SETTINGS_PATH"
     fi
   else
     printf "{}" > "$SETTINGS_PATH"; chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
@@ -358,7 +375,7 @@ install_settings_from_repo(){
     OLD_KEYS_JSON='[]'
   fi
 
-  tmp="$(mktemp)"
+  tmp_out="$(mktemp_in_dir "$SETTINGS_PATH")"
   jq \
     --arg flag "$GITSTRAP_FLAG" \
     --argjson repo "$(cat "$REPO_SETTINGS_SRC")" \
@@ -379,7 +396,7 @@ install_settings_from_repo(){
               .[$k] = ( if ($pres | index($k)) and ($user | has($k)) then $user[$k] else $repo[$k] end )
             )
         )
-    ' "$SETTINGS_PATH" > "$tmp" && mv "$tmp" "$SETTINGS_PATH"
+  ' "$SETTINGS_PATH" > "$tmp_out" && mv -f "$tmp_out" "$SETTINGS_PATH"
   chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
   printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"; chown "$PUID:$PGID" "$MANAGED_KEYS_FILE" 2>/dev/null || true
 
@@ -586,7 +603,7 @@ case "${1:-init}" in
     init_all
     ;;
   force)
-    # <-- key change: merge assets/inputs BEFORE running gitstrap
+    # merge assets/inputs BEFORE running gitstrap so flagged objects are refreshed
     ensure_assets_and_settings
     do_gitstrap
     ;;

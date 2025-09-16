@@ -6,13 +6,11 @@ log(){ echo "[gitstrap] $*"; }
 warn(){ echo "[gitstrap][WARN] $*" >&2; }
 redact(){ echo "$1" | sed 's/[A-Za-z0-9_\-]\{12,\}/***REDACTED***/g'; }
 
-# ensure_dir fixes ownership recursively
 ensure_dir(){ mkdir -p "$1" 2>/dev/null || true; chown -R "$PUID:$PGID" "$1" 2>/dev/null || true; }
 write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1" 2>/dev/null || true; }
 
 # temp file in same dir (avoid inter-device mv)
 mktemp_in_dir(){
-  local dir base
   dir="$(dirname "$1")"; base="$(basename "$1")"
   ensure_dir "$dir"
   mktemp "${dir}/${base}.XXXXXX"
@@ -40,15 +38,10 @@ PRIVATE_KEY_PATH="$SSH_DIR/$KEY_NAME"
 PUBLIC_KEY_PATH="$SSH_DIR/${KEY_NAME}.pub"
 
 LOCK_DIR="/run/gitstrap"
-LOCK_FILE="$LOCK_DIR/autorun.lock"
-mkdir -p "$LOCK_DIR" 2>/dev/null || true
+LOCK_FILE="$LOCK_DIR/autorun.lock"; mkdir -p "$LOCK_DIR" 2>/dev/null || true
 
-# code-server auth file (set FILE__HASHED_PASSWORD in compose)
 PASS_HASH_PATH="${FILE__HASHED_PASSWORD:-$STATE_DIR/codepass.hash}"
-
-# first-boot restart marker (processed by the restart gate)
 FIRSTBOOT_MARKER="$STATE_DIR/.firstboot-auth-restart"
-
 GITSTRAP_FLAG='__gitstrap_settings'
 
 # ========= bool normalize =========
@@ -60,7 +53,7 @@ normalize_bool(){
   else echo "true"; fi
 }
 
-# ========= restart gate (s6 service + tiny HTTP) =========
+# ========= restart gate =========
 install_restart_gate(){
   NODE_BIN=""
   for p in /usr/local/bin/node /usr/bin/node /app/code-server/lib/node /usr/lib/code-server/lib/node; do
@@ -112,11 +105,10 @@ EOF
   log "installed restart gate service (Node) on 127.0.0.1:9000"
 }
 
-# ========= default password (first boot only) =========
+# ========= default password =========
 init_default_password(){
   DEFAULT_PASSWORD="${DEFAULT_PASSWORD:-}"
   [ -n "$DEFAULT_PASSWORD" ] || { log "DEFAULT_PASSWORD not set; skipping default hash"; return 0; }
-
   if [ -s "$PASS_HASH_PATH" ]; then log "hash already present at $PASS_HASH_PATH; leaving as-is"; return 0; fi
 
   tries=0
@@ -128,16 +120,13 @@ init_default_password(){
   ensure_dir "$(dirname "$PASS_HASH_PATH")"
   salt="$(head -c16 /dev/urandom | base64)"
   hash="$(printf '%s' "$DEFAULT_PASSWORD" | argon2 "$salt" -id -e)"
-
   printf '%s' "$hash" > "$PASS_HASH_PATH"
   chmod 644 "$PASS_HASH_PATH" || true
   chown "$PUID:$PGID" "$PASS_HASH_PATH" 2>/dev/null || true
 
   head="$(printf '%s' "$hash" | cut -c1-24)"
   log "wrote initial Argon2 hash to $PASS_HASH_PATH (head=${head}...)"
-
-  ensure_dir "$(dirname "$FIRSTBOOT_MARKER")"
-  : > "$FIRSTBOOT_MARKER"
+  ensure_dir "$(dirname "$FIRSTBOOT_MARKER")"; : > "$FIRSTBOOT_MARKER"
   log "queued first-boot restart via marker: $FIRSTBOOT_MARKER"
 }
 
@@ -150,7 +139,6 @@ ensure_argon2(){
   done
   return 0
 }
-
 trigger_restart_gate(){
   if command -v curl >/dev/null 2>&1; then
     if curl -fsS --max-time 3 "http://127.0.0.1:9000/restart" >/dev/null 2>&1; then
@@ -162,7 +150,6 @@ trigger_restart_gate(){
     warn "curl not found; please restart the container manually"
   fi
 }
-
 apply_password_hash(){
   NEW="$1"; CONF="$2"
   [ -n "$NEW" ]  || { echo "Error: password is required." >&2; return 1; }
@@ -170,9 +157,7 @@ apply_password_hash(){
   [ "$NEW" = "$CONF" ] || { echo "Error: passwords do not match." >&2; return 1; }
   [ ${#NEW} -ge 8 ] || { echo "Error: password must be at least 8 characters." >&2; return 1; }
 
-  ensure_dir "$STATE_DIR"
-  ensure_argon2 || return 1
-
+  ensure_dir "$STATE_DIR"; ensure_argon2 || return 1
   salt="$(head -c16 /dev/urandom | base64)"
   hash="$(printf '%s' "$NEW" | argon2 "$salt" -id -e)"
   printf '%s' "$hash" > "$PASS_HASH_PATH"
@@ -188,9 +173,7 @@ apply_password_hash(){
   trigger_restart_gate
   return 0
 }
-
-codepass_set(){ apply_password_hash "${1:-}" "${2:-}"; exit 0; }  # subcommand compatibility
-
+codepass_set(){ apply_password_hash "${1:-}" "${2:-}"; exit 0; }
 maybe_apply_password_from_env(){
   if [ -n "${NEW_PASSWORD:-}" ] || [ -n "${CONFIRM_PASSWORD:-}" ]; then
     apply_password_hash "${NEW_PASSWORD:-}" "${CONFIRM_PASSWORD:-}" || true
@@ -201,7 +184,6 @@ maybe_apply_password_from_env(){
 install_user_assets(){
   ensure_dir "$USER_DIR"
 
-  # Single task; includes password inputs via env vars
   GITSTRAP_TASK='{
     "__gitstrap_settings": true,
     "label": "Bootstrap GitHub Workspace",
@@ -224,7 +206,6 @@ install_user_assets(){
     "gitstrap_preserve": []
   }'
 
-  # Inputs (always default to ${env:...} even if empty)
   INPUTS_JSON='[
     { "__gitstrap_settings": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}", "gitstrap_preserve": [] },
     { "__gitstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key)", "password": true, "gitstrap_preserve": [] },
@@ -236,7 +217,6 @@ install_user_assets(){
     { "__gitstrap_settings": true, "id": "confirm_password", "type": "promptString", "description": "Confirm the NEW password (leave blank to skip)", "password": true, "gitstrap_preserve": [] }
   ]'
 
-  # Two shortcuts → same single task (Ctrl+Alt+G and Ctrl+Alt+P)
   KB_G='{
     "__gitstrap_settings": true,
     "key": "ctrl+alt+g",
@@ -252,7 +232,7 @@ install_user_assets(){
     "gitstrap_preserve": []
   }'
 
-  # Normalize malformed keybindings.json → array
+  # normalize bad keybindings → array
   if [ -f "$KEYB_PATH" ] && command -v jq >/dev/null 2>&1; then
     tmp="$(mktemp_in_dir "$KEYB_PATH")"
     if ! jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
@@ -265,7 +245,7 @@ install_user_assets(){
   fi
 
   if command -v jq >/dev/null 2>&1; then
-    # ---- tasks.json upsert, and prune old flagged tasks not in desired set
+    # ---- tasks.json upsert with guards + prune old flagged tasks
     tmp_out="$(mktemp_in_dir "$TASKS_PATH")"
     if [ -f "$TASKS_PATH" ] && jq -e . "$TASKS_PATH" >/dev/null 2>&1; then
       jq \
@@ -279,31 +259,39 @@ install_user_assets(){
             | ( reduce (($old.gitstrap_preserve // [])[]) as $k ( . ; .[$k] = ($old[$k] // .[$k]) ) );
 
           (ensureObj(.)) as $root
-          | ($root.tasks  // []) as $tasks
-          | ($root.inputs // []) as $inputs
+          | ($root.tasks // []) as $tasks_raw
+          | (if ($tasks_raw|type)=="array" then $tasks_raw else [] end) as $tasks_arr
+          | ($tasks_arr | map(select(type=="object")))   as $task_objs
+          | ($tasks_arr | map(select(type!="object")))   as $task_nonobjs
           | .version = (.version // "2.0.0")
-
           | ($desired | map(.label) | unique) as $dlabels
 
-          # prune old flagged tasks we no longer manage (e.g., "Change code-server password")
-          | ($tasks | ensureArr(.) | map(
+          # prune flagged tasks we no longer manage, keep unflagged and non-objects
+          | ($task_objs | map(
               if ((.[$flag]? // false) == true)
-              then if ($dlabels | index(.label // "")) then . else empty end
+              then if ($dlabels | index((.label? // ""))) then . else empty end
               else . end
             )) as $t0
 
-          # upsert our single desired task by label
+          # upsert our single task by label (guard on type)
           | .tasks = (
-              reduce $desired[] as $nt ( $t0;
-                if any(.[]?; (type=="object") and ((.[$flag]? // false)==true) and (.label? // "") == ($nt.label // "")) then
-                  map(if (type=="object") and ((.[$flag]? // false)==true) and (.label? // "") == ($nt.label // "")
+              reduce $desired[] as $nt (
+                $t0;
+                if any(.[]?; (type=="object") and ((.[$flag]? // false)==true) and ((.label? // "") == ($nt.label // ""))) then
+                  map(if (type=="object") and ((.[$flag]? // false)==true) and ((.label? // "")==($nt.label // ""))
                       then merge_with_preserve(.; $nt; $flag) else . end)
                 else . + [ $nt ] end
               )
+              + $task_nonobjs
             )
+
+          # inputs strict upsert by id, prune flagged unknown ids
+          | (.inputs // []) as $inputs_raw
+          | (ensureArr($inputs_raw)) as $inputs
+          | ($desired_inputs // []) as $noop
         ' "$TASKS_PATH" > "$tmp_out"
 
-      # ---- inputs strict upsert by id, prune flagged unknown ids
+      # separate pass for inputs (so we can reuse .tasks result above)
       jq \
         --arg flag "$GITSTRAP_FLAG" \
         --argjson newinputs "$INPUTS_JSON" '
@@ -312,25 +300,23 @@ install_user_assets(){
             ($incoming + {($flag): true})
             | ( .gitstrap_preserve = ( (($old.gitstrap_preserve // []) + (.gitstrap_preserve // [])) | unique ) )
             | ( reduce (($old.gitstrap_preserve // [])[]) as $k ( . ; .[$k] = ($old[$k] // .[$k]) ) );
-
           (.inputs // []) as $inputs
           | .inputs = (
               ensureArr($inputs) as $cur
-              # remove flagged inputs not in desired set
               | ($newinputs | map(select(.id? != null) | .id) | unique) as $want
-              | ( $cur | map(
-                    if ((.[$flag]? // false)==true
-                        and (.id? // "") as $id
-                        | ($want | index($id) | not))
-                       then empty else . end
-                )) as $filtered
-              # upsert desired by id
+              | ( $cur
+                  | map(
+                      if ( (type=="object") and ((.[$flag]? // false)==true)
+                           and ((.id? // "") as $id | ($want | index($id) | not)) )
+                      then empty else . end
+                    )
+                ) as $filtered
               | reduce $newinputs[] as $inc (
                   $filtered;
                   ( ($inc.id? // "") ) as $id
                   | if $id == "" then .
-                    else if any(.[]?; (.id? // "") == $id) then
-                      map( if (.id? // "") == $id
+                    else if any(.[]?; (type=="object") and ((.id? // "") == $id)) then
+                      map( if ( (type=="object") and ((.id? // "") == $id) )
                         then ( if ((.[$flag]? // false) == true) then merge_with_preserve(.; $inc; $flag) else $inc end )
                         else . end )
                     else . + [ $inc ] end
@@ -338,6 +324,7 @@ install_user_assets(){
                 )
             )
         ' "$tmp_out" | tee "$tmp_out" >/dev/null
+
       mv -f "$tmp_out" "$TASKS_PATH"
     else
       printf '%s\n' "$(cat <<JSON
@@ -350,7 +337,7 @@ JSON
 )" > "$TASKS_PATH"
     fi
 
-    # ---- keybindings.json upsert, remove old password-task binding
+    # ---- keybindings.json upsert (guard non-objects) + remove old password binding
     tmp_kb="$(mktemp_in_dir "$KEYB_PATH")"
     if [ -f "$KEYB_PATH" ] && jq -e . "$KEYB_PATH" >/dev/null 2>&1; then
       jq \
@@ -363,27 +350,34 @@ JSON
             | ( reduce (($old.gitstrap_preserve // [])[]) as $k ( . ; .[$k] = ($old[$k] // .[$k]) ) );
 
           (ensureArr(.)) as $arr
-          # remove any old flagged binding that still points to "Change code-server password"
-          | ( $arr | map(
-                if ((.[$flag]? // false)==true
-                    and (.command? // "")=="workbench.action.tasks.runTask"
-                    and (.args? // "")=="Change code-server password")
-                then empty else . end
+          | ($arr | map(select(type=="object")))   as $kb_objs
+          | ($arr | map(select(type!="object")))   as $kb_nonobjs
+
+          # remove any old flagged binding pointing to the old password task
+          | ($kb_objs | map(
+              if ((.[$flag]? // false)==true
+                  and (.command? // "")=="workbench.action.tasks.runTask"
+                  and (.args? // "")=="Change code-server password")
+              then empty else . end
             )) as $clean
 
-          # upsert by (command,args,key) triple to allow two keys for same task
+          # upsert by (command,args,key), guard on objects
           | reduce $newkbs[] as $nk (
               $clean;
-              if any(.[]?; (.command? // "")==($nk.command // "")
+              if any(.[]?; (type=="object")
+                           and (.command? // "")==($nk.command // "")
+                           and (.args? // "")==($nk.args // "")
+                           and (.key? // "")==($nk.key // "")) then
+                map( if ( (type=="object")
+                          and (.command? // "")==($nk.command // "")
                           and (.args? // "")==($nk.args // "")
-                          and (.key? // "")==($nk.key // "")) then
-                map( if (.command? // "")==($nk.command // "")
-                      and (.args? // "")==($nk.args // "")
-                      and (.key? // "")==($nk.key // "")
-                    then ( if ((.[$flag]? // false)==true) then merge_with_preserve(.; $nk; $flag) else $nk end )
-                    else . end )
+                          and (.key? // "")==($nk.key // "") )
+                     then ( if ((.[$flag]? // false)==true) then merge_with_preserve(.; $nk; $flag) else $nk end )
+                     else . end )
               else . + [ $nk ] end
             )
+
+          | . + $kb_nonobjs
         ' "$KEYB_PATH" > "$tmp_kb" && mv -f "$tmp_kb" "$KEYB_PATH"
     else
       printf '[%s,%s]\n' "$KB_G" "$KB_P" > "$KEYB_PATH"
@@ -405,7 +399,7 @@ JSON
   log "installed/merged single task, inputs, and keybindings"
 }
 
-# ========= settings merge (repo -> user) with preserve =========
+# ========= settings merge =========
 install_settings_from_repo(){
   [ -f "$REPO_SETTINGS_SRC" ] || { log "no repo settings.json; skipping settings merge"; return 0; }
   if ! command -v jq >/dev/null 2>&1; then
@@ -481,7 +475,6 @@ resolve_email(){
   [ -n "${PUB_EMAIL:-}" ] && [ "$PUB_EMAIL" != "null" ] && { echo "$PUB_EMAIL"; return; }
   echo "${GH_USER}@users.noreply.github.com"
 }
-
 do_gitstrap(){
   : "${GH_USER:?GH_USER is required}"
   : "${GH_PAT:?GH_PAT is required}"
@@ -496,7 +489,6 @@ do_gitstrap(){
   git config --global init.defaultBranch main || true
   git config --global pull.ff only || true
   git config --global advice.detachedHead false || true
-  # Allow repos mounted with different ownership inside the container
   git config --global --add safe.directory "*"
 
   git config --global user.name "$GIT_NAME" || true
@@ -540,7 +532,6 @@ do_gitstrap(){
     spec=$(echo "$spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'); [ -n "$spec" ] || return 0
     repo="$spec"; branch=""
     case "$spec" in *'#'*) branch="${spec#*#}"; repo="${spec%%#*}";; esac
-
     case "$repo" in
       *"git@github.com:"*) url="$repo"; name="$(basename "$repo" .git)";;
       http*://github.com/*|ssh://git@github.com/*)
@@ -552,7 +543,6 @@ do_gitstrap(){
       */*) name="$(basename "$repo")"; url="git@github.com:${repo}.git";;
       *) log "skip invalid spec: $spec"; return 0;;
     esac
-
     dest="${BASE}/${name}"
     safe_url="$(echo "$url" | sed -E 's#(git@github\.com:).*#\1***.git#')"
 
@@ -586,11 +576,10 @@ do_gitstrap(){
   else
     log "GIT_REPOS empty; skip clone"
   fi
-
   log "gitstrap done"
 }
 
-# ========= autorun / orchestrate =========
+# ========= orchestrate =========
 autorun_or_hint(){
   if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ] && [ ! -f "$LOCK_FILE" ]; then
     : > "$LOCK_FILE" || true
@@ -618,8 +607,6 @@ ensure_assets_and_settings(){
 
 case "${1:-init}" in
   init) init_all ;;
-  # "force": refresh assets/settings first, then run gitstrap if GH env provided,
-  # then (optionally) apply password if NEW/CONFIRM provided.
   force)
     ensure_assets_and_settings
     if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ]; then

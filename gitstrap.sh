@@ -39,16 +39,18 @@ ensure_dir(){ mkdir -p "$1"; chown -R "$PUID:$PGID" "$1"; }
 write_file(){ printf "%s" "$2" > "$1"; chown "$PUID:$PGID" "$1"; }
 
 # Normalize a boolean-ish env/input (default TRUE)
-# Accepts: true/t/yes/y/1/on  -> true
-#          false/f/no/n/0/off -> false
+# Only the first letter matters: t/T => true, f/F => false, anything else => true
 normalize_bool(){
   v="${1:-true}"
-  v="$(printf "%s" "$v" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  case "$v" in
-    t*|y*|1|on|true)  echo "true" ;;
-    f*|n*|0|off|false) echo "false" ;;
-    *) echo "true" ;; # default
-  esac
+  v="$(printf "%s" "$v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  first="$(printf '%s' "$v" | cut -c1 | tr '[:upper:]' '[:lower:]')"
+  if [ "$first" = "t" ]; then
+    echo "true"
+  elif [ "$first" = "f" ]; then
+    echo "false"
+  else
+    echo "true"
+  fi
 }
 
 # ---------------------------
@@ -82,7 +84,7 @@ INPUTS_JSON='[
   { "__gitstrap_settings": true, "id": "git_email", "type": "promptString", "description": "Git email (optional; leave empty to auto-detect)", "default": "", "gitstrap_preserve": [] },
   { "__gitstrap_settings": true, "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}", "gitstrap_preserve": [] },
   { "__gitstrap_settings": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}", "gitstrap_preserve": [] },
-  { "__gitstrap_settings": true, "id": "pull_existing_repos", "type": "promptString", "description": "Pull existing repos if already cloned? (true/false)", "default": "${env:PULL_EXISTING_REPOS}", "gitstrap_preserve": [] }
+  { "__gitstrap_settings": true, "id": "pull_existing_repos", "type": "promptString", "description": "Pull existing repos if already cloned? (true/false, t/f)", "default": "${env:PULL_EXISTING_REPOS}", "gitstrap_preserve": [] }
 ]'
 
 KEYB_JSON='{

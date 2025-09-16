@@ -91,22 +91,23 @@ JSON
 }
 
 trigger_restart_hook(){
-  try() {
-    url="$1"
-    curl -fsS --max-time 3 "$url" >/dev/null 2>&1
-  }
+  # Try the host first (most reliable), then service names as fallback.
+  try() { curl -fsS --max-time 3 "$1" >/dev/null 2>&1; }
   if command -v curl >/dev/null 2>&1; then
-    if   try "http://restartd:9000/restart"; then
+    if   try "http://host.docker.internal:19000/restart"; then
+      log "restart sidecar responded at host.docker.internal:19000/restart"
+    elif try "http://restartd:9000/restart"; then
       log "restart sidecar responded at restartd:9000/restart"
     elif try "http://code-server-restartd:9000/restart"; then
       log "restart sidecar responded at code-server-restartd:9000/restart"
     else
-      log "WARN: restart trigger failed via DNS; please check compose network"
+      log "WARN: restart trigger failed via all URLs (host + DNS)."
     fi
   else
     log "curl not found; please restart the container manually"
   fi
 }
+
 
 
 

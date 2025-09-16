@@ -19,31 +19,34 @@ services:
       GIT_BASE_DIR: "/config/workspace"
 
     volumes:
-      - code-config:/config123
       - code-config:/config
       - projects:/config/workspace
       - ./settings.json:/config/gitstrap/settings.json:ro
       - ./gitstrap.sh:/custom-cont-init.d/10-gitstrap.sh:ro
       - ./codepass.sh:/custom-cont-init.d/20-codepass.sh:ro
-      # (No docker.sock or dockersock-group here anymore)
 
     ports:
       - ":8443"   # or "8443:8443"
+
+    # Allow calling the sidecar via host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     restart: always
     networks:
       appnet: {}
 
-  # Sidecar that watches the password file and restarts the code-server container when it changes
   restartd:
     image: alpine:3.20
     container_name: code-server-restartd
-    hostname: code-server-restartd                 # gives a deterministic DNS name
     user: "0:0"
     depends_on:
       - code
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    # Expose to the host so the code container can always hit it via host.docker.internal:19000
+    ports:
+      - "19000:9000"
     command:
       - /bin/sh
       - -ceu
@@ -55,7 +58,7 @@ services:
         IFS= read -r req || req=""
         # eat headers
         while IFS= read -r line; do [ -z "$line" ] && break; done
-        # log
+        # log request
         echo "[restartd] request: ${req}" >&2
         # route: only /restart triggers a restart; /health is no-op
         case "$req" in
@@ -72,12 +75,13 @@ services:
         fi
         EOF
         chmod +x /usr/local/bin/restart-hook
-        echo "[restartd] listening on :9000 (/restart to restart, /health for no-op)"
-        exec socat TCP-LISTEN:9000,reuseaddr,fork,keepalive,crlf EXEC:/usr/local/bin/restart-hook,setsid,pty,stderr
+        echo "[restartd] listening on :9000 (/restart to restart, /health no-op)"
+        # IMPORTANT: run via sh so heredoc indentation can't break the shebang
+        exec socat TCP-LISTEN:9000,reuseaddr,fork,keepalive,crlf \
+          EXEC:"/bin/sh /usr/local/bin/restart-hook",setsid,pty,stderr
     restart: always
     networks:
       appnet: {}
-
 
 networks:
   appnet:

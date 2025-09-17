@@ -38,7 +38,7 @@ PRIVATE_KEY_PATH="$SSH_DIR/$KEY_NAME"
 PUBLIC_KEY_PATH="$SSH_DIR/${KEY_NAME}.pub"
 
 LOCK_DIR="/run/gitstrap"
-LOCK_FILE="$LOCK_DIR/autorun.lock"; mkdir -p "$LOCK_DIR" 2>/dev/null || true
+LOCK_FILE="$LOCK_DIR/init-gitstrap.lock"; mkdir -p "$LOCK_DIR" 2>/dev/null || true
 
 # file that code-server reads on boot for auth (compose sets FILE__HASHED_PASSWORD)
 PASS_HASH_PATH="${FILE__HASHED_PASSWORD:-$STATE_DIR/codepass.hash}"
@@ -462,7 +462,7 @@ install_settings_from_repo(){
   chown "$PUID:$PGID" "$SETTINGS_PATH" 2>/dev/null || true
   printf "%s" "$RS_KEYS_JSON" > "$MANAGED_KEYS_FILE"; chown "$PUID:$PGID" "$MANAGED_KEYS_FILE" 2>/dev/null || true
 
-  log "merged settings.json (repo keys after marker; preserves honored) → $SETTINGS_PATH"
+  log "merged settings.json → $SETTINGS_PATH"
 }
 
 # ========= github bootstrap =========
@@ -588,8 +588,8 @@ autorun_or_hint(){
     log "env present and no lock → running gitstrap"
     do_gitstrap || true
   else
-    [ -f "$LOCK_FILE" ] && log "autorun lock present → skipping duplicate gitstrap this start"
-    { [ -z "${GH_USERNAME:-}" ] || [ -z "${GH_PAT:-}" ] ; } && log "GH_USERNAME/GH_PAT missing → skip autorun (use Ctrl+Alt+G)"
+    [ -f "$LOCK_FILE" ] && log "init-gitstrap lock present → skipping duplicate gitstrap this start"
+    { [ -z "${GH_USERNAME:-}" ] || [ -z "${GH_PAT:-}" ] ; } && log "GH_USERNAME/GH_PAT missing → skipping init gitstrap (use Ctrl+Alt+G inside code-server to gitstrap)"
   fi
 }
 
@@ -606,7 +606,7 @@ init_all(){
   install_user_assets
   install_settings_from_repo
   autorun_or_hint
-  log "Tasks, keybindings, (optional) settings installed under: $USER_DIR (reload window if not visible)"
+  log "Tasks, Keybindings, & Settings installed under: $USER_DIR (reload window if not visible)"
 }
 
 ensure_assets_and_settings(){

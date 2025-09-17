@@ -199,7 +199,7 @@ install_user_assets(){
     "args": ["/custom-cont-init.d/10-gitstrap.sh","force"],
     "options": {
       "env": {
-        "GH_USER": "${input:gh_user}",
+        "GH_USERNAME": "${input:gh_username}",
         "GH_PAT": "${input:gh_pat}",
         "GH_PAT_FALLBACK": "${env:GH_PAT}",
         "GIT_EMAIL": "${input:git_email}",
@@ -215,12 +215,12 @@ install_user_assets(){
   }'
 
   INPUTS_JSON='[
-    { "__gitstrap_settings": true, "id": "gh_user",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USER}", "gitstrap_preserve": [] },
-    { "__gitstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key). Leave blank to use env GH_PAT if set.", "password": true, "gitstrap_preserve": [] },
-    { "__gitstrap_settings": true, "id": "git_email", "type": "promptString", "description": "Git email (optional; leave empty to auto-detect)", "default": "${env:GIT_EMAIL}", "gitstrap_preserve": [] },
-    { "__gitstrap_settings": true, "id": "git_name",  "type": "promptString", "description": "Git name (optional; default = GH_USER)", "default": "${env:GIT_NAME}", "gitstrap_preserve": [] },
-    { "__gitstrap_settings": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo[#branch] or URLs, comma-separated)", "default": "${env:GIT_REPOS}", "gitstrap_preserve": [] },
-    { "__gitstrap_settings": true, "id": "pull_existing_repos", "type": "promptString", "description": "Pull existing repos if already cloned? (true/false, t/f)", "default": "${env:PULL_EXISTING_REPOS}", "gitstrap_preserve": [] },
+    { "__gitstrap_settings": true, "id": "gh_username",   "type": "promptString", "description": "GitHub username (required)", "default": "${env:GH_USERNAME}", "gitstrap_preserve": [] },
+    { "__gitstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key). Leave blank to use env var GH_PAT if set.", "password": true, "gitstrap_preserve": [] },
+    { "__gitstrap_settings": true, "id": "git_email", "type": "promptString", "description": "Git email (optional; leave empty to auto-detect github email)", "default": "${env:GIT_EMAIL}", "gitstrap_preserve": [] },
+    { "__gitstrap_settings": true, "id": "git_name",  "type": "promptString", "description": "Git name (optional; leave empty to use github username)", "default": "${env:GIT_NAME}", "gitstrap_preserve": [] },
+    { "__gitstrap_settings": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo or owner/repo#specific-branch or URL, comma-separated)", "default": "${env:GIT_REPOS}", "gitstrap_preserve": [] },
+    { "__gitstrap_settings": true, "id": "pull_existing_repos", "type": "promptString", "description": "Pull existing repos if already cloned? (true/false, t/f, etc.)", "default": "${env:PULL_EXISTING_REPOS}", "gitstrap_preserve": [] },
     { "__gitstrap_settings": true, "id": "new_password",     "type": "promptString", "description": "Enter a NEW code-server password (leave blank to skip)", "password": true, "gitstrap_preserve": [] },
     { "__gitstrap_settings": true, "id": "confirm_password", "type": "promptString", "description": "Confirm the NEW password (leave blank to skip)", "password": true, "gitstrap_preserve": [] }
   ]'
@@ -472,20 +472,20 @@ resolve_email(){
   [ -n "${PRIMARY:-}" ] && { echo "$PRIMARY"; return; }
   VERIFIED="$(printf "%s" "$EMAILS" | awk -F\" '/"email":/ {e=$4} /"verified": *true/ {print e; exit}')"
   [ -n "${VERIFIED:-}" ] && { echo "$VERIFIED"; return; }
-  PUB_JSON="$(curl -fsS -H "Accept: application/vnd.github+json" "https://api.github.com/users/${GH_USER}" || true)"
+  PUB_JSON="$(curl -fsS -H "Accept: application/vnd.github+json" "https://api.github.com/users/${GH_USERNAME}" || true)"
   PUB_EMAIL="$(printf "%s" "$PUB_JSON" | awk -F\" '/"email":/ {print $4; exit}')"
   [ -n "${PUB_EMAIL:-}" ] && [ "$PUB_EMAIL" != "null" ] && { echo "$PUB_EMAIL"; return; }
-  echo "${GH_USER}@users.noreply.github.com"
+  echo "${GH_USERNAME}@users.noreply.github.com"
 }
 do_gitstrap(){
-  : "${GH_USER:?GH_USER is required}"
+  : "${GH_USERNAME:?GH_USERNAME is required}"
   : "${GH_PAT:?GH_PAT is required}"
 
-  GIT_NAME="${GIT_NAME:-$GH_USER}"
+  GIT_NAME="${GIT_NAME:-$GH_USERNAME}"
   GIT_REPOS="${GIT_REPOS:-}"
   PULL_EXISTING_BOOL="$(normalize_bool "${PULL_EXISTING_REPOS:-true}")"
 
-  log "gitstrap: user=$GH_USER, name=$GIT_NAME, base=$BASE, pull_existing_repos=$PULL_EXISTING_BOOL"
+  log "gitstrap: user=$GH_USERNAME, name=$GIT_NAME, base=$BASE, pull_existing_repos=$PULL_EXISTING_BOOL"
   mkdir -p "$BASE" && chown -R "$PUID:$PGID" "$BASE" || true
 
   git config --global init.defaultBranch main || true
@@ -583,13 +583,13 @@ do_gitstrap(){
 
 # ========= main phases =========
 autorun_or_hint(){
-  if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ] && [ ! -f "$LOCK_FILE" ]; then
+  if [ -n "${GH_USERNAME:-}" ] && [ -n "${GH_PAT:-}" ] && [ ! -f "$LOCK_FILE" ]; then
     : > "$LOCK_FILE" || true
     log "env present and no lock → running gitstrap"
     do_gitstrap || true
   else
     [ -f "$LOCK_FILE" ] && log "autorun lock present → skipping duplicate gitstrap this start"
-    { [ -z "${GH_USER:-}" ] || [ -z "${GH_PAT:-}" ] ; } && log "GH_USER/GH_PAT missing → skip autorun (use Ctrl+Alt+G)"
+    { [ -z "${GH_USERNAME:-}" ] || [ -z "${GH_PAT:-}" ] ; } && log "GH_USERNAME/GH_PAT missing → skip autorun (use Ctrl+Alt+G)"
   fi
 }
 
@@ -622,10 +622,10 @@ case "${1:-init}" in
     # Merge assets/settings first so prompts show correctly, then coalesce envs.
     ensure_assets_and_settings
     resolve_task_env_fallbacks
-    if [ -n "${GH_USER:-}" ] && [ -n "${GH_PAT:-}" ]; then
+    if [ -n "${GH_USERNAME:-}" ] && [ -n "${GH_PAT:-}" ]; then
       do_gitstrap
     else
-      log "GH_USER/GH_PAT not provided → skipping repo bootstrap (you can still update password in this run)"
+      log "GH_USERNAME/GH_PAT not provided → skipping repo bootstrap (you can still update password in this run)"
     fi
     maybe_apply_password_from_env
     ;;

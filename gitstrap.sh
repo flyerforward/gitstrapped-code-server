@@ -204,7 +204,7 @@ install_user_assets(){
         "GH_PAT_FALLBACK": "${env:GH_PAT}",
         "GIT_EMAIL": "${input:git_email}",
         "GIT_NAME": "${input:git_name}",
-        "GIT_REPOS": "${input:git_repos}",
+        "GH_REPOS": "${input:gh_repos}",
         "PULL_EXISTING_REPOS": "${input:pull_existing_repos}",
         "NEW_PASSWORD": "${input:new_password}",
         "CONFIRM_PASSWORD": "${input:confirm_password}"
@@ -219,7 +219,7 @@ install_user_assets(){
     { "__gitstrap_settings": true, "id": "gh_pat",    "type": "promptString", "description": "GitHub PAT (classic; scopes: user:email, admin:public_key). Leave blank to use env var GH_PAT if set.", "password": true, "gitstrap_preserve": [] },
     { "__gitstrap_settings": true, "id": "git_email", "type": "promptString", "description": "Git email (optional; leave empty to auto-detect github email)", "default": "${env:GIT_EMAIL}", "gitstrap_preserve": [] },
     { "__gitstrap_settings": true, "id": "git_name",  "type": "promptString", "description": "Git name (optional; leave empty to use github username)", "default": "${env:GIT_NAME}", "gitstrap_preserve": [] },
-    { "__gitstrap_settings": true, "id": "git_repos", "type": "promptString", "description": "Repos to clone (owner/repo or owner/repo#specific-branch or URL, comma-separated)", "default": "${env:GIT_REPOS}", "gitstrap_preserve": [] },
+    { "__gitstrap_settings": true, "id": "gh_repos", "type": "promptString", "description": "Repos to clone (owner/repo or owner/repo#specific-branch or URL, comma-separated)", "default": "${env:GH_REPOS}", "gitstrap_preserve": [] },
     { "__gitstrap_settings": true, "id": "pull_existing_repos", "type": "promptString", "description": "Pull existing repos if already cloned? (true/false, t/f, etc.)", "default": "${env:PULL_EXISTING_REPOS}", "gitstrap_preserve": [] },
     { "__gitstrap_settings": true, "id": "new_password",     "type": "promptString", "description": "Enter a NEW code-server password (leave blank to skip)", "password": true, "gitstrap_preserve": [] },
     { "__gitstrap_settings": true, "id": "confirm_password", "type": "promptString", "description": "Confirm the NEW password (leave blank to skip)", "password": true, "gitstrap_preserve": [] }
@@ -482,7 +482,7 @@ do_gitstrap(){
   : "${GH_PAT:?GH_PAT is required}"
 
   GIT_NAME="${GIT_NAME:-$GH_USERNAME}"
-  GIT_REPOS="${GIT_REPOS:-}"
+  GH_REPOS="${GH_REPOS:-}"
   PULL_EXISTING_BOOL="$(normalize_bool "${PULL_EXISTING_REPOS:-true}")"
 
   log "gitstrap: user=$GH_USERNAME, name=$GIT_NAME, base=$BASE, pull_existing_repos=$PULL_EXISTING_BOOL"
@@ -572,11 +572,11 @@ do_gitstrap(){
     chown -R "$PUID:$PGID" "$dest" || true
   }
 
-  if [ -n "${GIT_REPOS:-}" ]; then
-    IFS=,; set -- $GIT_REPOS; unset IFS
+  if [ -n "${GH_REPOS:-}" ]; then
+    IFS=,; set -- $GH_REPOS; unset IFS
     for spec in "$@"; do clone_one "$spec"; done
   else
-    log "GIT_REPOS empty; skip clone"
+    log "GH_REPOS empty; skip clone"
   fi
   log "gitstrap done"
 }
@@ -606,7 +606,7 @@ init_all(){
   install_user_assets
   install_settings_from_repo
   autorun_or_hint
-  log "Tasks, Keybindings, & Settings installed under: $USER_DIR (reload window if not visible)"
+  log "Tasks, Keybindings, & Settings installed under: $USER_DIR"
 }
 
 ensure_assets_and_settings(){
@@ -625,7 +625,7 @@ case "${1:-init}" in
     if [ -n "${GH_USERNAME:-}" ] && [ -n "${GH_PAT:-}" ]; then
       do_gitstrap
     else
-      log "GH_USERNAME/GH_PAT not provided → skipping repo bootstrap (you can still update password in this run)"
+      log "GH_USERNAME or GH_PAT not provided → skipping repo bootstrap"
     fi
     maybe_apply_password_from_env
     ;;

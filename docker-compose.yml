@@ -5,8 +5,8 @@ services:
       FILE__HASHED_PASSWORD: "/config/.gitstrap/password.hash"
       DOCKER_MODS: linuxserver/mods:universal-package-install
       INSTALL_PACKAGES: argon2
-      PUID: ${PUID}
-      PGID: ${PGID}
+      PUID: "1000"
+      PGID: "1000"
       TZ: ${TZ}
       DEFAULT_PASSWORD: ${DEFAULT_PASSWORD}
       GH_USERNAME: "${GH_USERNAME}"
